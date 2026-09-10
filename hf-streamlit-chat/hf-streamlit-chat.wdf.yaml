@@ -7,19 +7,26 @@
 #    will GENERATE one (slim Python + pip + `streamlit run app.py`, non-root).
 #  - autoscaling is pinned to 1 replica: all apps share a local SQLite store
 #    (shared/database/*.db), which is not safe to run multi-replica as-is.
-#  - HF apps are vLLM-only clients (no in-process Transformers). The model
-#    server is a SEPARATE component (vllm-server) that the chat-ui proxies to
-#    via BACKEND_URLS. The common model across all model-serving apps is
-#    meta-llama/Llama-3.1-8B-Instruct (vLLM id) = meta/llama-3.1-8b-instruct (NIM).
+#  - HF apps are OpenAI-compatible clients (no in-process Transformers). The model
+#    server is a SEPARATE component. The gcp-gpu-vm scenario uses
+#    NVIDIA NIM (nvcr.io/nim/meta/llama-3.1-8b-instruct) as the model
+#    server; the chat-ui proxies to it via BACKEND_URLS. The common model
+#    across all model-serving apps is meta-llama/Llama-3.1-8B-Instruct
+#    (vLLM id) = meta/llama-3.1-8b-instruct (NIM catalog id).
+#  - NIM needs NGC_API_KEY (secret ngc-api-key); vLLM would need HUGGING_FACE_HUB_TOKEN
+#    (secret hf-hub-token). Both are declared below; only the one
+#    matching the chosen model server is injected per scenario.
 #  - The gcp-gpu-vm scenario is an alternate (v2 schema allows only
 #    scenarios.native + scenarios.alternates[]). It targets TDF
 #    `model-serving-gpu-vm-gcp-us-central` via deployments[].target.tdfRef.
+#    NOTE: on this A100 VM the NVIDIA driver must be the proprietary
+#    610.57.04 branch (the open 615 kernel module hangs on CUDA compute).
 apiVersion: wdf.7sg.ai/v2
 kind: WorkloadDefinition
 metadata:
   name: hf-streamlit-chat
-  version: 1.1.2
-  description: HuggingFace Streamlit chat UI. OpenAI-compatible client to vLLM (no in-process Transformers).
+  version: 1.1.3
+  description: HuggingFace Streamlit chat UI. OpenAI-compatible client to a model server (NIM on GCP GPU VM, vLLM locally).
   tags:
     env: dev
 source:
@@ -32,9 +39,18 @@ security:
 secrets:
   provider: sherpa-vault
   secretRefs:
-    # Needed to pull gated Llama-3.1 weights from HuggingFace into the vLLM
-    # container. Injected into the vllm-server component only. Value lives in
-    # the org Vault under this exact name (same pattern as TDF SSH/GCP refs).
+    # NIM model server needs an NGC API key to download/serve the Llama
+    # weights from the NGC catalog. Injected into the nim-server
+    # component only. Value lives in the org Vault under this
+    # exact name (same pattern as TDF SSH/GCP refs).
+    - name: ngc-api-key
+      injectAs: env
+      envVar: NGC_API_KEY
+      source_type: internal_value
+      internalRef: ngc-api-key
+    # vLLM path needs a HuggingFace hub token to pull gated Llama
+    # weights. Used by the native (local) scenario. Value lives in
+    # the org Vault under this exact name.
     - name: hf-hub-token
       injectAs: env
       envVar: HUGGING_FACE_HUB_TOKEN
@@ -110,7 +126,7 @@ scenarios:
           - name: HF_MODEL_NAME
             value: meta-llama/Llama-3.1-8B-Instruct
           - name: BACKEND_URLS
-            value: http://vllm-server:8000/v1/chat/completions
+            value: http://nim-server:8000/v1/chat/completions
           - name: BACKEND_STRATEGY
             value: round_robin
         endpoints:
@@ -119,14 +135,14 @@ scenarios:
           exposure: public
           protocol: http
           path: /
-      - name: vllm-server
+      - name: nim-server
         role: custom
         runtime:
           platform: vm
           regions:
           - us-central1
           image:
-            repository: vllm/vllm-openai
+            repository: nvcr.io/nim/meta/llama-3.1-8b-instruct
             tag: latest
           resources:
             cpu: '4'
@@ -141,14 +157,10 @@ scenarios:
               metric: cpu
               target: 70
           env:
-          - name: VLLM_MODEL
-            value: meta-llama/Llama-3.1-8B-Instruct
-          - name: TENSOR_PARALLEL_SIZE
-            value: '1'
-          - name: VLLM_MAX_MODEL_LEN
-            value: '8192'
+          - name: NIM_MODEL_NAME
+            value: meta/llama-3.1-8b-instruct
           envFromSecretRefs:
-          - hf-hub-token
+          - ngc-api-key
         endpoints:
         - name: http
           port: 8000
@@ -165,7 +177,7 @@ scenarios:
         cloudCredentialRef: gcp
       components:
       - chat-ui
-      - vllm-server
+      - nim-server
   - name: azure-kubernetes
     description: Scale-out on an AKS GPU node pool.
     topology:
