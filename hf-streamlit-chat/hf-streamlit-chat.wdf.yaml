@@ -18,7 +18,7 @@ apiVersion: wdf.7sg.ai/v2
 kind: WorkloadDefinition
 metadata:
   name: hf-streamlit-chat
-  version: 1.1.1
+  version: 1.1.2
   description: HuggingFace Streamlit chat UI. OpenAI-compatible client to vLLM (no in-process Transformers).
   tags:
     env: dev
@@ -30,17 +30,16 @@ security:
   policies:
     secretsInEnvAllowed: true
 secrets:
-  provider: external-secrets
+  provider: sherpa-vault
   secretRefs:
     # Needed to pull gated Llama-3.1 weights from HuggingFace into the vLLM
-    # container. Injected into the vllm-server component only.
+    # container. Injected into the vllm-server component only. Value lives in
+    # the org Vault under this exact name (same pattern as TDF SSH/GCP refs).
     - name: hf-hub-token
       injectAs: env
       envVar: HUGGING_FACE_HUB_TOKEN
-      source_type: external_vault
-      externalRef:
-        provider: vault
-        key: secret/model-serving/hf-hub-token
+      source_type: internal_value
+      internalRef: hf-hub-token
 scenarios:
   native:
     description: Local single-node container host (matches the repo's local-first setup).
