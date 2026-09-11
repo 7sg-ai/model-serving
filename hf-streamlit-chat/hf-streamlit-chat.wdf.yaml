@@ -3,8 +3,9 @@
 # services/artifacts/schema/wdf.schema.202605011755.json.
 #
 # NOTES / placeholders to review before use:
-#  - This app has no Dockerfile; the platform build step (deploy_build_planner)
-#    will GENERATE one (slim Python + pip + `streamlit run app.py`, non-root).
+#  - This app has no per-app Dockerfile. The gcp-gpu-vm scenario builds
+#    Streamlit from repo root + deploy/Dockerfile.python (so shared/ is
+#    included). Native local remains generate-and-build / vLLM HF id.
 #  - autoscaling is pinned to 1 replica: all apps share a local SQLite store
 #    (shared/database/*.db), which is not safe to run multi-replica as-is.
 #  - HF apps are OpenAI-compatible clients (no in-process Transformers). The model
@@ -25,7 +26,7 @@ apiVersion: wdf.7sg.ai/v2
 kind: WorkloadDefinition
 metadata:
   name: hf-streamlit-chat
-  version: 1.1.3
+  version: 1.1.4
   description: HuggingFace Streamlit chat UI. OpenAI-compatible client to a model server (NIM on GCP GPU VM, vLLM locally).
   tags:
     env: dev
@@ -113,6 +114,8 @@ scenarios:
           image:
             repository: model-serving/hf-streamlit-chat
             tag: latest
+            context: .
+            dockerfile: deploy/Dockerfile.python
           resources:
             cpu: '2'
             memory: 4Gi
@@ -124,7 +127,13 @@ scenarios:
               target: 70
           env:
           - name: HF_MODEL_NAME
-            value: meta-llama/Llama-3.1-8B-Instruct
+            value: meta/llama-3.1-8b-instruct
+          - name: NIM_MODEL_NAME
+            value: meta/llama-3.1-8b-instruct
+          - name: LOAD_MODEL_WEIGHTS
+            value: 'false'
+          - name: AUTO_DEPLOY_MODEL
+            value: 'false'
           - name: BACKEND_URLS
             value: http://nim-server:8000/v1/chat/completions
           - name: BACKEND_STRATEGY
