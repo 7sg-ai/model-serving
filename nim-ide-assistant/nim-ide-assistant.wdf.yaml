@@ -1,20 +1,32 @@
-# Workload Definition File (WDF) — generated for nim-ide-assistant
+# Workload Definition File (WDF) — corrected for nim-ide-assistant
 # apiVersion wdf.7sg.ai/v2 (scenario-based). Validated against
 # services/artifacts/schema/wdf.schema.202605011755.json.
 #
 # NOTES / placeholders to review before use:
-#  - This app has no Dockerfile; the platform build step must produce the image
-#    (runtime.image.repository below is a suggested name; registry is left to the build/push).
+#  - This app has no per-app Dockerfile. The gcp-gpu-vm scenario builds
+#    Flask from repo root + deploy/Dockerfile.python (so shared/ is
+#    included). Native local remains a client to an already-running NIM.
 #  - autoscaling is pinned to 1 replica: all apps share a local SQLite store
 #    (shared/database/*.db), which is not safe to run multi-replica as-is.
-#  - secret externalRef.key values are placeholder Vault paths — set real ones.
-#  - Requires a reachable NIM model server (its own NGC_API_KEY); not part of this WDF.
+#  - This app is an OpenAI-compatible IDE API (Cline/Cursor). It does NOT
+#    own the GPU NIM. On gcp-gpu-vm it attaches to the NIM already serving
+#    hf-streamlit-chat on the same VM (host :8000). Do not start a second
+#    GPU container (TDF maxGPUs: 1).
+#  - AUTO_DEPLOY_MODEL must stay false on gcp-gpu-vm so the container does
+#    not try to docker-run another NIM.
+#  - API_KEY (secret ide-api-key) authenticates IDE clients. Value lives in
+#    the org Vault under this exact name.
+#  - The gcp-gpu-vm scenario is an alternate (v2 schema allows only
+#    scenarios.native + scenarios.alternates[]). It targets TDF
+#    `model-serving-gpu-vm-gcp-us-central` via deployments[].target.tdfRef.
+#    NOTE: on this A100 VM the NVIDIA driver must be the proprietary
+#    610.57.04 branch (the open 615 kernel module hangs on CUDA compute).
 apiVersion: wdf.7sg.ai/v2
 kind: WorkloadDefinition
 metadata:
   name: nim-ide-assistant
-  version: 1.0.0
-  description: NIM-backed OpenAI-compatible API for IDE coding assistants (Cline/Cursor).
+  version: 1.1.0
+  description: NIM-backed OpenAI-compatible API for IDE coding assistants (Cline/Cursor). Attaches to the shared GPU VM NIM; does not own the GPU.
   tags:
     env: dev
 source:
@@ -25,14 +37,14 @@ security:
   policies:
     secretsInEnvAllowed: true
 secrets:
-  provider: external-secrets
+  provider: sherpa-vault
   secretRefs:
-  - name: ide-api-key
-    injectAs: env
-    envVar: API_KEY
-    externalRef:
-      provider: vault
-      key: secret/model-serving/nim-ide-assistant/api-key
+    # IDE client auth (Cline/Cursor). Injected into ide-api as API_KEY.
+    - name: ide-api-key
+      injectAs: env
+      envVar: API_KEY
+      source_type: internal_value
+      internalRef: ide-api-key
 scenarios:
   native:
     description: Local single-node container host (matches the repo's local-first setup).
@@ -61,12 +73,14 @@ scenarios:
             value: http://nim-llama:8000/v1/chat/completions
           - name: NIM_MODEL_NAME
             value: meta/llama-3.1-8b-instruct
+          - name: AUTO_DEPLOY_MODEL
+            value: 'false'
           - name: MAX_TOKENS
-            value: '4096'
+            value: '32768'
           - name: TEMPERATURE
-            value: '0.7'
+            value: '0.3'
           - name: CONTEXT_WINDOW
-            value: '8192'
+            value: '1048576'
           envFromSecretRefs:
           - ide-api-key
         endpoints:
@@ -84,6 +98,75 @@ scenarios:
       components:
       - ide-api
   alternates:
+  # CPU-light Flask IDE API on the same GPU VM as hf-streamlit-chat.
+  # Does not declare nim-server: the A100 NIM on :8000 is already running.
+  # Attach via host-gateway so this compose project does not need the
+  # chat stack's docker network.
+  - name: gcp-gpu-vm
+    description: Pre-provisioned GCP GPU VM. ide-api only; reuses the live NIM on host :8000.
+    topology:
+      components:
+      - name: ide-api
+        role: api
+        runtime:
+          platform: vm
+          regions:
+          - us-central1
+          image:
+            repository: model-serving/nim-ide-assistant
+            tag: latest
+            context: .
+            dockerfile: deploy/Dockerfile.python
+          resources:
+            cpu: '2'
+            memory: 4Gi
+          autoscaling:
+            minReplicas: 1
+            maxReplicas: 1
+            policy:
+              metric: cpu
+              target: 70
+          env:
+          - name: NIM_API_URL
+            value: http://host.docker.internal:8000/v1/chat/completions
+          - name: BACKEND_URLS
+            value: http://host.docker.internal:8000/v1/chat/completions
+          - name: BACKEND_STRATEGY
+            value: round_robin
+          - name: NIM_MODEL_NAME
+            value: meta/llama-3.1-8b-instruct
+          - name: LOAD_MODEL_WEIGHTS
+            value: 'false'
+          - name: AUTO_DEPLOY_MODEL
+            value: 'false'
+          - name: HOST
+            value: 0.0.0.0
+          - name: PORT
+            value: '8080'
+          - name: MAX_TOKENS
+            value: '32768'
+          - name: TEMPERATURE
+            value: '0.3'
+          - name: CONTEXT_WINDOW
+            value: '1048576'
+          envFromSecretRefs:
+          - ide-api-key
+        endpoints:
+        - name: http
+          port: 8080
+          exposure: public
+          protocol: http
+          path: /v1
+    deployments:
+    - name: gcp-us-central
+      target:
+        provider: gcp
+        region: us-central1
+        namespace: model-serving
+        tdfRef: model-serving-gpu-vm-gcp-us-central
+        cloudCredentialRef: gcp
+      components:
+      - ide-api
   - name: azure-kubernetes
     description: Scale-out on an AKS GPU node pool.
     topology:
@@ -111,12 +194,14 @@ scenarios:
             value: http://nim-llama:8000/v1/chat/completions
           - name: NIM_MODEL_NAME
             value: meta/llama-3.1-8b-instruct
+          - name: AUTO_DEPLOY_MODEL
+            value: 'false'
           - name: MAX_TOKENS
-            value: '4096'
+            value: '32768'
           - name: TEMPERATURE
-            value: '0.7'
+            value: '0.3'
           - name: CONTEXT_WINDOW
-            value: '8192'
+            value: '1048576'
           envFromSecretRefs:
           - ide-api-key
         endpoints:
