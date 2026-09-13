@@ -70,8 +70,10 @@ sessions/
 chat_history/
 gh_pat
 
-# Profile audio TTS cache only (committed WAVs live under profile_data/audio/)
+# Profile audio: generate locally (macOS say / tone). Do not commit WAVs —
+# afconvert FLLR chunks are NUL-padded and trip binary/null-byte scanners.
 **/profile_data/.audio_cache/
+**/profile_data/audio/*.wav
 
 # Auto-generated model runtime compose (shared.deploy / tests)
 deploy/docker-compose.*.generated.yml
