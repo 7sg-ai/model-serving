@@ -8,12 +8,12 @@
 #    included). Native local remains a client to an already-running NIM.
 #  - autoscaling is pinned to 1 replica: all apps share a local SQLite store
 #    (shared/database/*.db), which is not safe to run multi-replica as-is.
-#  - This app is an OpenAI-compatible IDE API (Cline/Cursor). It does NOT
-#    own the GPU NIM. On gcp-gpu-vm it attaches to the NIM already serving
-#    hf-streamlit-chat on the same VM (host :8000). Do not start a second
-#    GPU container (TDF maxGPUs: 1).
-#  - AUTO_DEPLOY_MODEL must stay false on gcp-gpu-vm so the container does
-#    not try to docker-run another NIM.
+#  - This app is an OpenAI-compatible IDE API (Cline/Cursor). On gcp-gpu-vm
+#    Sherpa deploys NVIDIA NIM first, verifies /v1/models, then starts ide-api.
+#    Do not run a second GPU NIM alongside hf-streamlit-chat (TDF maxGPUs: 1).
+#  - AUTO_DEPLOY_MODEL must stay false so ide-api does not docker-run another NIM.
+#  - API_KEY (secret ide-api-key) authenticates IDE clients. NGC_API_KEY
+#    (secret ngc-api-key) pulls/serves Llama weights for nim-server.
 #  - API_KEY (secret ide-api-key) authenticates IDE clients. Value lives in
 #    the org Vault under this exact name.
 #  - The gcp-gpu-vm scenario is an alternate (v2 schema allows only
@@ -25,8 +25,8 @@ apiVersion: wdf.7sg.ai/v2
 kind: WorkloadDefinition
 metadata:
   name: nim-ide-assistant
-  version: 1.1.0
-  description: NIM-backed OpenAI-compatible API for IDE coding assistants (Cline/Cursor). Attaches to the shared GPU VM NIM; does not own the GPU.
+  version: 1.2.1
+  description: NIM-backed OpenAI-compatible API for IDE coding assistants (Cline/Cursor). GPU VM scenario deploys NIM then ide-api.
   tags:
     env: dev
 source:
@@ -45,6 +45,12 @@ secrets:
       envVar: API_KEY
       source_type: internal_value
       internalRef: ide-api-key
+    # NIM model server needs an NGC API key to download/serve Llama weights.
+    - name: ngc-api-key
+      injectAs: env
+      envVar: NGC_API_KEY
+      source_type: internal_value
+      internalRef: ngc-api-key
 scenarios:
   native:
     description: Local single-node container host (matches the repo's local-first setup).
@@ -98,14 +104,59 @@ scenarios:
       components:
       - ide-api
   alternates:
-  # CPU-light Flask IDE API on the same GPU VM as hf-streamlit-chat.
-  # Does not declare nim-server: the A100 NIM on :8000 is already running.
-  # Attach via host-gateway so this compose project does not need the
-  # chat stack's docker network.
+  # CPU-light Flask IDE API plus GPU NIM on the same VM. Sherpa apply
+  # starts nim-server first, then ide-api. Dual-deploy with
+  # hf-streamlit-chat is not supported (one GPU).
   - name: gcp-gpu-vm
-    description: Pre-provisioned GCP GPU VM. ide-api only; reuses the live NIM on host :8000.
+    description: Pre-provisioned GCP GPU VM. NIM first, then ide-api on :8080.
+    evaluation:
+      judge:
+        prompt_version: gpu-synthetic-goldens.v1
+        prompt: >
+          Score structure and intent, not string equality. Goldens are synthetic
+          multi-turn coding templates (plan, implement, tests, review notes), not
+          verbatim answers. Judge the assistant's last reply against the last user
+          turn: it PASSES when it addresses that turn's intent (plan, code, tests,
+          or review) with plausible structure. Extra correct detail is fine. Fail
+          only on empty/refusal answers or a clearly unrelated topic.
+      sla:
+        semantic_quality_min: 0.6
+        accepted_answer_rate_min_pct: 60
+      gate_enabled: false
     topology:
       components:
+      - name: nim-server
+        role: custom
+        runtime:
+          platform: vm
+          regions:
+          - us-central1
+          image:
+            repository: nvcr.io/nim/meta/llama-3.1-8b-instruct
+            tag: latest
+          resources:
+            cpu: '4'
+            memory: 32Gi
+            gpu:
+              count: 1
+              type: nvidia-a100-40gb
+          autoscaling:
+            minReplicas: 1
+            maxReplicas: 1
+            policy:
+              metric: cpu
+              target: 70
+          env:
+          - name: NIM_MODEL_NAME
+            value: meta/llama-3.1-8b-instruct
+          envFromSecretRefs:
+          - ngc-api-key
+        endpoints:
+        - name: http
+          port: 8000
+          exposure: internal
+          protocol: http
+          path: /v1
       - name: ide-api
         role: api
         runtime:
@@ -128,9 +179,9 @@ scenarios:
               target: 70
           env:
           - name: NIM_API_URL
-            value: http://host.docker.internal:8000/v1/chat/completions
+            value: http://nim-server:8000/v1/chat/completions
           - name: BACKEND_URLS
-            value: http://host.docker.internal:8000/v1/chat/completions
+            value: http://nim-server:8000/v1/chat/completions
           - name: BACKEND_STRATEGY
             value: round_robin
           - name: NIM_MODEL_NAME
@@ -166,6 +217,7 @@ scenarios:
         tdfRef: model-serving-gpu-vm-gcp-us-central
         cloudCredentialRef: gcp
       components:
+      - nim-server
       - ide-api
   - name: azure-kubernetes
     description: Scale-out on an AKS GPU node pool.

@@ -26,7 +26,7 @@ apiVersion: wdf.7sg.ai/v2
 kind: WorkloadDefinition
 metadata:
   name: hf-streamlit-chat
-  version: 1.1.4
+  version: 1.1.5
   description: HuggingFace Streamlit chat UI. OpenAI-compatible client to a model server (NIM on GCP GPU VM, vLLM locally).
   tags:
     env: dev
@@ -103,6 +103,20 @@ scenarios:
   # `docker compose up -d` over SSH after immutable approval.
   - name: gcp-gpu-vm
     description: Pre-provisioned GCP GPU VM (Docker + NVIDIA Container Toolkit) in us-central1.
+    evaluation:
+      judge:
+        prompt_version: gpu-synthetic-goldens.v1
+        prompt: >
+          Score structure and intent, not string equality. Goldens are synthetic
+          templates of expected qualities (clear, structured, actionable), not
+          verbatim answers. A candidate PASSES when it addresses the user's
+          question intent and follows a similar structure (restated goal, core
+          guidance, at least one concrete detail or example). Extra correct
+          detail is fine. Fail only on empty/refusal answers or a different topic.
+      sla:
+        semantic_quality_min: 0.6
+        accepted_answer_rate_min_pct: 60
+      gate_enabled: false
     topology:
       components:
       - name: chat-ui
