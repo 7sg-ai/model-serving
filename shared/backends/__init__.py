@@ -7,6 +7,11 @@ from .openai_chat import (
     require_backend_urls,
     resolve_vllm_backend_urls,
 )
+from .streaming import (
+    flask_sse_from_completion,
+    flask_sse_from_upstream,
+    post_chat_stream,
+)
 
 __all__ = [
     "OpenAIChatClient",
@@ -15,4 +20,7 @@ __all__ = [
     "normalize_chat_url",
     "require_backend_urls",
     "resolve_vllm_backend_urls",
+    "flask_sse_from_completion",
+    "flask_sse_from_upstream",
+    "post_chat_stream",
 ]

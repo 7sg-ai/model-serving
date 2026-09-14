@@ -22,6 +22,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.auth import AuthManager
 from shared.database import ChatHistory
 from shared.cache import ResponseCache, ConversationMemory
+from shared.backends import (
+    flask_sse_from_completion,
+    flask_sse_from_upstream,
+    post_chat_stream,
+)
 from shared.multinode import (
     BackendPool,
     ClusterInfo,
@@ -35,6 +40,7 @@ from shared.switchyard import (
     get_switchyard_router,
     write_routes_toml,
 )
+
 
 app = Flask(__name__)
 CORS(app)
@@ -226,23 +232,39 @@ def remember_exchange(conversation_id, messages, assistant_content):
 
 
 def _legacy_upstream_chat(messages, temperature, max_tokens, stream, model_name):
-    """Single-backend NIM path (Switchyard disabled)."""
-    nim_payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": stream,
-    }
+    """Single-backend NIM path (Switchyard disabled).
+
+    When stream=True, returns a live requests.Response (SSE) that the caller
+    must proxy; when stream=False, returns the parsed OpenAI JSON body.
+    """
     backend = CLUSTER.next_backend() or NIM_API_URL
     try:
+        if stream:
+            upstream = post_chat_stream(
+                backend,
+                messages,
+                model=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=float(REQUEST_TIMEOUT),
+            )
+            CLUSTER.backend_pool.mark_success(backend)
+            return upstream
+        nim_payload = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
         response = requests.post(backend, json=nim_payload, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         CLUSTER.backend_pool.mark_success(backend)
+        return response.json()
     except Exception:
         CLUSTER.backend_pool.mark_failure(backend)
         raise
-    return response.json()
+
 
 
 @app.route("/v1/models", methods=["GET"])
@@ -326,6 +348,41 @@ def chat_completions():
             return jsonify(result)
 
     try:
+        if stream:
+            # Cline / Cursor send stream=true. Proxy SSE (or synthesize it after
+            # Switchyard finishes a non-stream route decision).
+            def _on_complete(text: str) -> None:
+                remember_exchange(conversation_id, messages, text)
+
+            if SY_CFG.enabled:
+                # Escalation/capability need the full reply before judging —
+                # run non-stream upstream then convert to SSE for the client.
+                result, assistant_content, _served = SY_ROUTER.chat_completions(
+                    messages,
+                    requested_model=requested_model,
+                    temperature=float(temperature),
+                    max_tokens=int(max_tokens),
+                    session_id=conversation_id or "default",
+                    stream=False,
+                )
+                if assistant_content:
+                    remember_exchange(conversation_id, messages, assistant_content)
+                model_out = (
+                    (_served.id if _served else None)
+                    or (result.get("model") if isinstance(result, dict) else None)
+                    or requested_model
+                    or MODEL_NAME
+                )
+                return flask_sse_from_completion(
+                    result if isinstance(result, dict) else {"choices": [{"message": {"content": assistant_content or ""}, "finish_reason": "stop"}]},
+                    model=model_out,
+                )
+
+            upstream = _legacy_upstream_chat(
+                messages, temperature, max_tokens, True, MODEL_NAME
+            )
+            return flask_sse_from_upstream(upstream, on_complete=_on_complete)
+
         if SY_CFG.enabled:
             result, assistant_content, _served = SY_ROUTER.chat_completions(
                 messages,
@@ -333,13 +390,13 @@ def chat_completions():
                 temperature=float(temperature),
                 max_tokens=int(max_tokens),
                 session_id=conversation_id or "default",
-                stream=bool(stream),
+                stream=False,
             )
             if assistant_content:
                 remember_exchange(conversation_id, messages, assistant_content)
         else:
             result = _legacy_upstream_chat(
-                messages, temperature, max_tokens, stream, MODEL_NAME
+                messages, temperature, max_tokens, False, MODEL_NAME
             )
             try:
                 assistant_content = result["choices"][0]["message"]["content"]
@@ -368,6 +425,7 @@ def chat_completions():
             ),
             500,
         )
+
 
 
 @app.route("/v1/completions", methods=["POST"])

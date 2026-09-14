@@ -25,9 +25,13 @@ from shared.cache import (
 )
 from shared.backends import (
     OpenAIChatClient,
+    flask_sse_from_completion,
+    flask_sse_from_upstream,
     normalize_chat_url,
+    post_chat_stream,
     require_backend_urls,
 )
+
 from shared.deploy import ensure_models_runtime
 from shared.multinode import (
     BackendPool,
@@ -340,6 +344,7 @@ def chat_completions():
     temperature = float(data.get("temperature", DEFAULT_TEMPERATURE))
     max_tokens = int(data.get("max_tokens", DEFAULT_MAX_TOKENS))
     max_tokens = max(1, min(max_tokens, EFFECTIVE_CONTEXT_WINDOW - 64))
+    stream = bool(data.get("stream", False))
     requested_model = data.get("model") or MODEL_NAME
 
     conversation_id = (
@@ -369,16 +374,74 @@ def chat_completions():
     cache_model = requested_model or MODEL_NAME
     if SY_CFG.enabled:
         cache_model = f"sy:{SY_CFG.strategy}:{cache_model}"
-    cache_key = response_cache.make_key(
-        cache_model, messages, temperature, max_tokens
-    )
-    cached = response_cache.get(cache_key)
-    if cached is not None:
-        result = copy.deepcopy(cached)
-        result["cached"] = True
-        return jsonify(result)
+    cache_key = None
+    if not stream:
+        cache_key = response_cache.make_key(
+            cache_model, messages, temperature, max_tokens
+        )
+        cached = response_cache.get(cache_key)
+        if cached is not None:
+            result = copy.deepcopy(cached)
+            result["cached"] = True
+            return jsonify(result)
 
     try:
+        if stream:
+            def _on_complete(text: str) -> None:
+                remember_exchange(conversation_id, messages, text)
+
+            if SY_CFG.enabled:
+                result, response_text, served = SY_ROUTER.chat_completions(
+                    messages,
+                    requested_model=requested_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    session_id=conversation_id,
+                    stream=False,
+                )
+                remember_exchange(conversation_id, messages, response_text)
+                model_out = (
+                    (served.id if served else None)
+                    or (result.get("model") if isinstance(result, dict) else None)
+                    or requested_model
+                    or MODEL_NAME
+                )
+                return flask_sse_from_completion(
+                    result
+                    if isinstance(result, dict)
+                    else {
+                        "choices": [
+                            {
+                                "message": {"content": response_text or ""},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    },
+                    model=model_out,
+                )
+
+            backend = CLUSTER.next_backend()
+            if not backend:
+                raise RuntimeError(
+                    "No inference backend available "
+                    "(BACKEND_URLS / VLLM_API_URL empty or all cooling down)"
+                )
+            try:
+                upstream = post_chat_stream(
+                    backend,
+                    messages,
+                    model=requested_model or MODEL_NAME,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_key=VLLM_API_KEY,
+                    timeout=float(REQUEST_TIMEOUT),
+                )
+                CLUSTER.backend_pool.mark_success(backend)
+            except Exception:
+                CLUSTER.backend_pool.mark_failure(backend)
+                raise
+            return flask_sse_from_upstream(upstream, on_complete=_on_complete)
+
         if SY_CFG.enabled:
             result, response_text, served = SY_ROUTER.chat_completions(
                 messages,
@@ -391,7 +454,8 @@ def chat_completions():
             if isinstance(result, dict):
                 result = dict(result)
                 result["cached"] = False
-            response_cache.set(cache_key, result)
+            if cache_key is not None:
+                response_cache.set(cache_key, result)
             return jsonify(result)
 
         response_text, prompt_tokens, completion_tokens, _raw = generate_response(
@@ -433,8 +497,10 @@ def chat_completions():
         "cached": False,
     }
 
-    response_cache.set(cache_key, result)
+    if cache_key is not None:
+        response_cache.set(cache_key, result)
     return jsonify(result)
+
 
 @app.route("/v1/completions", methods=["POST"])
 def completions():

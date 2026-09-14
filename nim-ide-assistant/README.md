@@ -58,6 +58,9 @@ The server will start on port 8080 and display configuration details.
 
 ### For Cline (VS Code Extension)
 
+> **Streaming:** Cline sends `stream: true` by default. This server proxies OpenAI SSE
+> (`text/event-stream`) from the upstream backend. Non-stream JSON still works.
+
 1. Open VS Code Settings
 2. Search for "Cline"
 3. Configure:
