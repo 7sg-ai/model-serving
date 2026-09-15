@@ -14,13 +14,14 @@ import logging
 import random
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import requests
 
 from .client import ModelClient
 from .config import ModelSpec, SwitchyardConfig, get_switchyard_config
-from .escalation import EscalationRouter, build_escalation_router
+from .escalation import EscalationRouter, EscalationResult, build_escalation_router
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,24 @@ LocalGenerateFn = Callable[
     [ModelSpec, List[Dict[str, Any]], float, int],
     Tuple[str, Dict[str, Any]],
 ]
+
+
+@dataclass
+class StreamOutcome:
+    """Result of a streaming Switchyard turn for IDE servers to proxy."""
+
+    # Exactly one of upstream / completion is set for a successful outcome.
+    upstream: Optional[requests.Response] = None
+    completion: Optional[Dict[str, Any]] = None
+    assistant_text: str = ""
+    served: Optional[ModelSpec] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+    # When True, IDE should synthesize SSE from completion (buffer path).
+    synthesize_sse: bool = False
+
+    @property
+    def is_live_stream(self) -> bool:
+        return self.upstream is not None
 
 
 class SwitchyardRouter:
@@ -200,6 +219,26 @@ class SwitchyardRouter:
         result = client.chat(messages, temperature=temperature, max_tokens=max_tokens)
         return result, client.extract_assistant_text(result)
 
+    def _external_chat_url(self) -> str:
+        base = (self.cfg.external_url or "").rstrip("/")
+        if not base:
+            raise RuntimeError("SWITCHYARD_SERVER_URL / external_url is empty")
+        if base.endswith("/chat/completions"):
+            return base
+        if base.endswith("/v1"):
+            return base + "/chat/completions"
+        return base + "/v1/chat/completions"
+
+    def _external_headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.external_api_key_env:
+            import os
+
+            key = os.getenv(self.cfg.external_api_key_env, "")
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+        return headers
+
     def _proxy_external(
         self,
         messages: List[Dict[str, Any]],
@@ -210,35 +249,57 @@ class SwitchyardRouter:
         stream: bool = False,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        base = self.cfg.external_url.rstrip("/")
-        url = base
-        if not url.endswith("/chat/completions"):
-            if url.endswith("/v1"):
-                url = url + "/chat/completions"
-            else:
-                url = url + "/v1/chat/completions"
+        """Non-stream JSON proxy to switchyard-server."""
+        url = self._external_chat_url()
         payload = {
             "model": model or self.cfg.route_id,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": stream,
+            "stream": False,
         }
         if extra:
             payload.update(extra)
-        headers = {"Content-Type": "application/json"}
-        if self.cfg.external_api_key_env:
-            import os
-
-            key = os.getenv(self.cfg.external_api_key_env, "")
-            if key:
-                headers["Authorization"] = f"Bearer {key}"
+            payload["stream"] = False
+        headers = self._external_headers()
         resp = requests.post(url, json=payload, headers=headers, timeout=300)
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict):
-            data.setdefault("switchyard", {"route": "external", "url": base})
+            data.setdefault(
+                "switchyard", {"route": "external", "url": self.cfg.external_url}
+            )
         return data
+
+    def _proxy_external_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> requests.Response:
+        """SSE proxy to switchyard-server (open Response; caller must close)."""
+        from shared.backends.streaming import post_chat_stream
+
+        url = self._external_chat_url()
+        headers = self._external_headers()
+        api_key = ""
+        auth = headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            api_key = auth[7:].strip()
+        return post_chat_stream(
+            url,
+            messages,
+            model=model or self.cfg.route_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_key=api_key,
+            timeout=300.0,
+            extra=extra,
+            headers={k: v for k, v in headers.items() if k.lower() != "authorization"},
+        )
 
     def _capability_route(
         self,
@@ -361,7 +422,7 @@ class SwitchyardRouter:
                 model=model,
                 temperature=temp,
                 max_tokens=mt,
-                stream=stream,
+                stream=False,
                 extra=extra,
             )
             text = ""
@@ -433,6 +494,266 @@ class SwitchyardRouter:
             "model_id": spec.id,
         }
         return resp, text, spec
+
+
+    def _capability_pick(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> Tuple[ModelSpec, Dict[str, Any]]:
+        """Run the capability judge and return (chosen_spec, meta)."""
+        weak = self.cfg.weak()
+        strong = self.cfg.strong()
+        judge = self.cfg.judge() or weak
+        if not weak:
+            raise RuntimeError("No weak/default model configured for capability routing")
+        if not strong:
+            strong = weak
+
+        preview = []
+        for m in messages[-6:]:
+            c = m.get("content", "")
+            if not isinstance(c, str):
+                c = str(c)
+            preview.append({"role": m.get("role", "user"), "content": c[:500]})
+        judge_msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You classify coding tasks. "
+                    'Return ONLY JSON: {"verdict":"strong"|"weak","reason":"..."}. '
+                    "Use strong for complex multi-file refactors, architecture, hard bugs; "
+                    "weak for simple edits, explanations, small snippets."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Task messages:\n" + str(preview),
+            },
+        ]
+        pick = strong
+        try:
+            jclient = self._client(judge)
+            jres = jclient.chat(judge_msgs, temperature=0.0, max_tokens=256)
+            jtext = jclient.extract_assistant_text(jres).lower()
+            if "weak" in jtext and "strong" not in jtext.split("weak")[0][-20:]:
+                if '"verdict": "weak"' in jtext or '"verdict":"weak"' in jtext:
+                    pick = weak
+                elif "verdict" in jtext and "strong" in jtext:
+                    pick = strong
+                else:
+                    pick = weak if "weak" in jtext else strong
+            elif "strong" in jtext:
+                pick = strong
+            else:
+                pick = weak
+        except Exception as exc:
+            logger.warning("Capability judge failed, defaulting to weak: %s", exc)
+            pick = weak
+
+        meta = {
+            "route": "capability",
+            "served_by": pick.role or pick.name,
+            "model_id": pick.id,
+        }
+        return pick, meta
+
+    def _open_spec_stream(
+        self,
+        spec: ModelSpec,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+    ) -> requests.Response:
+        if self.local_generate is not None and not (
+            spec.deployment.backend_urls or spec.deployment.coordinator_url or spec.chat_url()
+        ):
+            raise RuntimeError(
+                f"Cannot stream model '{spec.name}': no remote backend URL "
+                "(local_generate is non-stream only)"
+            )
+        return self._client(spec).chat_stream(
+            messages, temperature=temperature, max_tokens=max_tokens
+        )
+
+    def chat_completions_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        requested_model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        session_id: str = "default",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> StreamOutcome:
+        """
+        Route a streaming chat completion.
+
+        - Target known before answer tokens → live upstream SSE
+        - Unlatched escalation (need buffer+judge) → completion + synthesize_sse,
+          except confirmed escalate which opens a live strong stream
+        - External switchyard-server → live SSE proxy
+        """
+        if not self.cfg.enabled:
+            raise RuntimeError("Switchyard is not enabled")
+
+        sid = session_id or "default"
+
+        # External proxy: live SSE
+        if self.cfg.strategy == "external":
+            model = requested_model or self.cfg.route_id
+            temp = 0.3 if temperature is None else float(temperature)
+            mt = 32768 if max_tokens is None else int(max_tokens)
+            upstream = self._proxy_external_stream(
+                messages,
+                model=model,
+                temperature=temp,
+                max_tokens=mt,
+                extra=extra,
+            )
+            return StreamOutcome(
+                upstream=upstream,
+                meta={"route": "external", "model": model},
+            )
+
+        # Direct model selection → live SSE
+        if not self.is_route_request(requested_model):
+            spec = self.resolve_spec(requested_model)
+            if spec is None:
+                raise RuntimeError(f"Unknown model: {requested_model}")
+            temp = spec.temperature if temperature is None else float(temperature)
+            mt = spec.max_tokens if max_tokens is None else int(max_tokens)
+            mt = max(1, min(mt, spec.context_window - 512))
+            upstream = self._open_spec_stream(spec, messages, temp, mt)
+            return StreamOutcome(
+                upstream=upstream,
+                served=spec,
+                meta={
+                    "route": "direct",
+                    "served_by": spec.name,
+                    "model_id": spec.id,
+                },
+            )
+
+        strategy = self.cfg.strategy
+
+        if strategy == "escalation":
+            if not self.escalation:
+                raise RuntimeError(
+                    "Escalation router not configured (need weak + strong models)"
+                )
+            esc = self.escalation
+            # Already latched → live strong stream
+            if esc.is_latched(sid):
+                temp = temperature
+                mt = max_tokens
+                s_temp = esc.strong.temperature if temp is None else float(temp)
+                s_mt = esc.strong.max_tokens if mt is None else int(mt)
+                s_mt = max(1, min(s_mt, esc.strong.context_window - 512))
+                # touch turn counter like route() would
+                state = esc.get_state(sid)
+                state.turns += 1
+                upstream = esc.open_strong_stream(
+                    messages, temperature=s_temp, max_tokens=s_mt
+                )
+                return StreamOutcome(
+                    upstream=upstream,
+                    served=esc.strong,
+                    meta={
+                        "route": "escalation",
+                        "served_by": "strong",
+                        "latched": True,
+                        "model_id": esc.strong.id,
+                    },
+                )
+
+            # Unlatched: buffer weak + judge; stream strong only on escalate
+            result = esc.route_unlatched_commit(
+                messages,
+                session_id=sid,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if result.escalated and result.served_by == "strong":
+                s_temp = (
+                    esc.strong.temperature
+                    if temperature is None
+                    else float(temperature)
+                )
+                s_mt = (
+                    esc.strong.max_tokens
+                    if max_tokens is None
+                    else int(max_tokens)
+                )
+                s_mt = max(1, min(s_mt, esc.strong.context_window - 512))
+                upstream = esc.open_strong_stream(
+                    messages, temperature=s_temp, max_tokens=s_mt
+                )
+                meta = dict(result.response.get("switchyard") or {})
+                meta.setdefault("model_id", esc.strong.id)
+                return StreamOutcome(
+                    upstream=upstream,
+                    served=esc.strong,
+                    meta=meta,
+                )
+
+            # Serve buffered weak as synthesized SSE
+            return StreamOutcome(
+                completion=result.response,
+                assistant_text=result.assistant_text,
+                served=result.model,
+                meta=dict(result.response.get("switchyard") or {}),
+                synthesize_sse=True,
+            )
+
+        if strategy == "capability":
+            chosen, meta = self._capability_pick(messages)
+            temp = float(temperature) if temperature is not None else chosen.temperature
+            mt = int(max_tokens) if max_tokens is not None else chosen.max_tokens
+            mt = max(1, min(mt, chosen.context_window - 512))
+            upstream = self._open_spec_stream(chosen, messages, temp, mt)
+            return StreamOutcome(
+                upstream=upstream,
+                served=chosen,
+                meta=meta,
+            )
+
+        if strategy == "random":
+            models = self.cfg.selectable_models()
+            if not models:
+                raise RuntimeError("No models configured for random routing")
+            spec = random.choice(models)
+            temp = float(temperature) if temperature is not None else spec.temperature
+            mt = int(max_tokens) if max_tokens is not None else spec.max_tokens
+            mt = max(1, min(mt, spec.context_window - 512))
+            upstream = self._open_spec_stream(spec, messages, temp, mt)
+            return StreamOutcome(
+                upstream=upstream,
+                served=spec,
+                meta={
+                    "route": "random",
+                    "served_by": spec.name,
+                    "model_id": spec.id,
+                },
+            )
+
+        # passthrough
+        spec = self.cfg.default_model()
+        if not spec:
+            raise RuntimeError("No models configured")
+        temp = spec.temperature if temperature is None else float(temperature)
+        mt = spec.max_tokens if max_tokens is None else int(max_tokens)
+        mt = max(1, min(mt, spec.context_window - 512))
+        upstream = self._open_spec_stream(spec, messages, temp, mt)
+        return StreamOutcome(
+            upstream=upstream,
+            served=spec,
+            meta={
+                "route": "passthrough",
+                "served_by": spec.name,
+                "model_id": spec.id,
+            },
+        )
+
 
 
 _ROUTER: Optional[SwitchyardRouter] = None

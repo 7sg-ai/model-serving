@@ -349,32 +349,44 @@ def chat_completions():
 
     try:
         if stream:
-            # Cline / Cursor send stream=true. Proxy SSE (or synthesize it after
-            # Switchyard finishes a non-stream route decision).
+            # Cline / Cursor send stream=true. Prefer live upstream SSE when the
+            # serving target is known; synthesize SSE only when escalation must
+            # buffer weak+judge before committing a reply.
             def _on_complete(text: str) -> None:
                 remember_exchange(conversation_id, messages, text)
 
             if SY_CFG.enabled:
-                # Escalation/capability need the full reply before judging —
-                # run non-stream upstream then convert to SSE for the client.
-                result, assistant_content, _served = SY_ROUTER.chat_completions(
+                outcome = SY_ROUTER.chat_completions_stream(
                     messages,
                     requested_model=requested_model,
                     temperature=float(temperature),
                     max_tokens=int(max_tokens),
                     session_id=conversation_id or "default",
-                    stream=False,
                 )
-                if assistant_content:
-                    remember_exchange(conversation_id, messages, assistant_content)
+                if outcome.is_live_stream:
+                    return flask_sse_from_upstream(
+                        outcome.upstream, on_complete=_on_complete
+                    )
+                result = outcome.completion or {
+                    "choices": [
+                        {
+                            "message": {"content": outcome.assistant_text or ""},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+                if outcome.assistant_text:
+                    remember_exchange(
+                        conversation_id, messages, outcome.assistant_text
+                    )
                 model_out = (
-                    (_served.id if _served else None)
+                    (outcome.served.id if outcome.served else None)
                     or (result.get("model") if isinstance(result, dict) else None)
                     or requested_model
                     or MODEL_NAME
                 )
                 return flask_sse_from_completion(
-                    result if isinstance(result, dict) else {"choices": [{"message": {"content": assistant_content or ""}, "finish_reason": "stop"}]},
+                    result if isinstance(result, dict) else result,
                     model=model_out,
                 )
 

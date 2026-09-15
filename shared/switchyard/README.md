@@ -163,6 +163,23 @@ Matches NeMo Switchyard escalation router:
 
 Session key: `X-Conversation-ID` header, or `user` / `conversation_id` body fields.
 
+
+## Streaming
+
+IDE assistants call `SwitchyardRouter.chat_completions_stream` when the client
+sends `stream: true`:
+
+| Situation | Behavior |
+|-----------|----------|
+| Direct model id / passthrough / random | Live upstream SSE |
+| Capability (after judge picks tier) | Live upstream SSE |
+| Escalation already latched | Live strong SSE |
+| Escalation unlatched, decline | Buffer weak+judge → synthesize SSE |
+| Escalation unlatched, confirmed escalate | Discard weak → live strong SSE |
+| `strategy=external` | Live SSE proxy to switchyard-server |
+
+Non-stream `chat_completions` is unchanged (full JSON, including `switchyard` meta).
+
 ## Code entry points
 
 - `shared.switchyard.get_switchyard_config()` — load env/file config  

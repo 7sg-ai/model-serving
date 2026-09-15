@@ -16,7 +16,7 @@ from .config import (
 )
 from .client import ModelClient, chat_completion
 from .escalation import EscalationRouter, EscalationState
-from .router import SwitchyardRouter, get_switchyard_router
+from .router import StreamOutcome, SwitchyardRouter, get_switchyard_router
 from .toml_export import export_routes_toml, write_routes_toml
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "chat_completion",
     "EscalationRouter",
     "EscalationState",
+    "StreamOutcome",
     "SwitchyardRouter",
     "get_switchyard_router",
     "export_routes_toml",

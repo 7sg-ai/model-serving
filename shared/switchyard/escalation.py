@@ -131,6 +131,10 @@ class EscalationRouter:
         with self._lock:
             self._states.pop(session_id or "default", None)
 
+    def is_latched(self, session_id: str) -> bool:
+        """True when this session is already latched to the strong tier."""
+        return bool(self.get_state(session_id or "default").latched)
+
     def stats(self) -> Dict[str, Any]:
         with self._lock:
             latched = sum(1 for s in self._states.values() if s.latched)
@@ -410,6 +414,121 @@ class EscalationRouter:
             streak=state.streak,
             state=state,
         )
+
+
+    def open_strong_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ):
+        """Open a live SSE response from the strong tier (caller proxies it)."""
+        s_temp = self.strong.temperature if temperature is None else temperature
+        s_mt = self.strong.max_tokens if max_tokens is None else max_tokens
+        s_mt = max(1, min(int(s_mt), self.strong.context_window - 512))
+        if self._local_generate is not None:
+            raise RuntimeError(
+                "open_strong_stream requires a remote strong backend "
+                "(_local_generate cannot produce SSE)"
+            )
+        return self._strong_client.chat_stream(
+            messages, temperature=s_temp, max_tokens=s_mt
+        )
+
+    def route_unlatched_commit(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        session_id: str = "default",
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> EscalationResult:
+        """
+        Run weak+judge for an unlatched session and commit state.
+
+        On confirmed escalate, does not call strong — caller should open a
+        live strong stream via open_strong_stream (discard weak this turn).
+        """
+        state = self.get_state(session_id)
+        state.turns += 1
+
+        if state.latched:
+            return self.route(
+                messages,
+                session_id=session_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        w_temp = self.weak.temperature if temperature is None else temperature
+        w_mt = self.weak.max_tokens if max_tokens is None else max_tokens
+        w_mt = max(1, min(int(w_mt), self.weak.context_window - 512))
+        weak_resp, weak_text = self._call_model(
+            self.weak, self._weak_client, messages, w_temp, w_mt
+        )
+
+        verdict, reason = self._judge(messages, weak_text)
+        state.last_verdict = verdict
+        state.last_reason = reason
+
+        if verdict == "escalate":
+            state.streak += 1
+        else:
+            state.streak = 0
+
+        if state.streak >= max(1, self.settings.confirmations):
+            state.latched = True
+            state.latched_at = time.time()
+            placeholder: Dict[str, Any] = {
+                "switchyard": {
+                    "served_by": "strong",
+                    "latched": True,
+                    "escalated": True,
+                    "judge_verdict": verdict,
+                    "judge_reason": reason,
+                    "streak": state.streak,
+                    "route": "escalation",
+                    "discarded_weak": True,
+                    "stream_strong": True,
+                }
+            }
+            return EscalationResult(
+                response=placeholder,
+                assistant_text="",
+                served_by="strong",
+                model=self.strong,
+                escalated=True,
+                latched=True,
+                judge_verdict=verdict,
+                judge_reason=reason,
+                streak=state.streak,
+                state=state,
+            )
+
+        weak_resp = dict(weak_resp)
+        weak_resp["switchyard"] = {
+            "served_by": "weak",
+            "latched": False,
+            "escalated": False,
+            "judge_verdict": verdict,
+            "judge_reason": reason,
+            "streak": state.streak,
+            "route": "escalation",
+        }
+        return EscalationResult(
+            response=weak_resp,
+            assistant_text=weak_text,
+            served_by="weak",
+            model=self.weak,
+            escalated=False,
+            latched=False,
+            judge_verdict=verdict,
+            judge_reason=reason,
+            streak=state.streak,
+            state=state,
+        )
+
 
 
 def build_escalation_router(

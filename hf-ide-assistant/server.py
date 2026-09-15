@@ -391,32 +391,37 @@ def chat_completions():
                 remember_exchange(conversation_id, messages, text)
 
             if SY_CFG.enabled:
-                result, response_text, served = SY_ROUTER.chat_completions(
+                outcome = SY_ROUTER.chat_completions_stream(
                     messages,
                     requested_model=requested_model,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     session_id=conversation_id,
-                    stream=False,
                 )
-                remember_exchange(conversation_id, messages, response_text)
+                if outcome.is_live_stream:
+                    return flask_sse_from_upstream(
+                        outcome.upstream, on_complete=_on_complete
+                    )
+                result = outcome.completion or {
+                    "choices": [
+                        {
+                            "message": {"content": outcome.assistant_text or ""},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+                if outcome.assistant_text:
+                    remember_exchange(
+                        conversation_id, messages, outcome.assistant_text
+                    )
                 model_out = (
-                    (served.id if served else None)
+                    (outcome.served.id if outcome.served else None)
                     or (result.get("model") if isinstance(result, dict) else None)
                     or requested_model
                     or MODEL_NAME
                 )
                 return flask_sse_from_completion(
-                    result
-                    if isinstance(result, dict)
-                    else {
-                        "choices": [
-                            {
-                                "message": {"content": response_text or ""},
-                                "finish_reason": "stop",
-                            }
-                        ]
-                    },
+                    result if isinstance(result, dict) else result,
                     model=model_out,
                 )
 

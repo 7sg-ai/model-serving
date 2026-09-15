@@ -3,6 +3,9 @@ OpenAI-compatible chat client for Switchyard model targets.
 
 Each ModelSpec may point at a different backend URL pool with its own
 timeout, API key, and extra_body — independent deployment parameters.
+
+Non-stream calls always use JSON bodies. Streaming uses shared SSE helpers
+and must never be parsed with response.json().
 """
 from __future__ import annotations
 
@@ -93,6 +96,41 @@ class ModelClient:
             ]
         self.pool = _UrlPool(urls, strategy=spec.deployment.backend_strategy)
 
+    def _build_payload(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        stream: bool,
+        extra: Optional[Dict[str, Any]],
+        model_id_override: Optional[str],
+    ) -> Dict[str, Any]:
+        temp = self.spec.temperature if temperature is None else temperature
+        mt = self.spec.max_tokens if max_tokens is None else max_tokens
+        payload: Dict[str, Any] = {
+            "model": model_id_override or self.spec.id,
+            "messages": messages,
+            "temperature": temp,
+            "max_tokens": mt,
+            "stream": bool(stream),
+        }
+        if self.spec.top_p is not None:
+            payload["top_p"] = self.spec.top_p
+        for k, v in (self.spec.extra_body or {}).items():
+            payload.setdefault(k, v)
+        if extra:
+            payload.update(extra)
+        payload["stream"] = bool(stream)
+        return payload
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        api_key = self.spec.resolve_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -104,36 +142,30 @@ class ModelClient:
         model_id_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        POST chat/completions. Returns the OpenAI-style JSON body.
-        Raises requests.HTTPError / RequestException on failure.
+        POST chat/completions as non-stream JSON.
+
+        ``stream`` is accepted for compatibility but always forced False.
+        Use :meth:`chat_stream` for SSE.
         """
+        if stream:
+            logger.debug(
+                "ModelClient.chat(stream=True) coerced to JSON; use chat_stream()"
+            )
         url = self.pool.next()
         if not url:
             raise RuntimeError(
                 f"No backend URL configured for model '{self.spec.name}' ({self.spec.id})"
             )
 
-        temp = self.spec.temperature if temperature is None else temperature
-        mt = self.spec.max_tokens if max_tokens is None else max_tokens
-        payload: Dict[str, Any] = {
-            "model": model_id_override or self.spec.id,
-            "messages": messages,
-            "temperature": temp,
-            "max_tokens": mt,
-            "stream": stream,
-        }
-        if self.spec.top_p is not None:
-            payload["top_p"] = self.spec.top_p
-        # Merge extra_body from spec (do not overwrite request keys)
-        for k, v in (self.spec.extra_body or {}).items():
-            payload.setdefault(k, v)
-        if extra:
-            payload.update(extra)
-
-        headers = {"Content-Type": "application/json"}
-        api_key = self.spec.resolve_api_key()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        payload = self._build_payload(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=False,
+            extra=extra,
+            model_id_override=model_id_override,
+        )
+        headers = self._headers()
 
         try:
             resp = requests.post(
@@ -145,11 +177,63 @@ class ModelClient:
             resp.raise_for_status()
             self.pool.mark_success(url)
             data = resp.json()
-            # Annotate which target served
             if isinstance(data, dict):
                 data.setdefault("switchyard_target", self.spec.name)
                 data.setdefault("switchyard_model_id", self.spec.id)
             return data
+        except Exception:
+            self.pool.mark_failure(url)
+            raise
+
+    def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        model_id_override: Optional[str] = None,
+    ) -> requests.Response:
+        """
+        POST chat/completions with stream=true.
+
+        Returns an open streaming Response. Caller must close it
+        (flask_sse_from_upstream does this).
+        """
+        from shared.backends.streaming import post_chat_stream
+
+        url = self.pool.next()
+        if not url:
+            raise RuntimeError(
+                f"No backend URL configured for model '{self.spec.name}' ({self.spec.id})"
+            )
+
+        temp = self.spec.temperature if temperature is None else temperature
+        mt = self.spec.max_tokens if max_tokens is None else max_tokens
+        merged_extra: Dict[str, Any] = {}
+        for k, v in (self.spec.extra_body or {}).items():
+            if k != "stream":
+                merged_extra[k] = v
+        if extra:
+            for k, v in extra.items():
+                if k != "stream":
+                    merged_extra[k] = v
+        if self.spec.top_p is not None:
+            merged_extra.setdefault("top_p", self.spec.top_p)
+
+        try:
+            upstream = post_chat_stream(
+                url,
+                messages,
+                model=model_id_override or self.spec.id,
+                temperature=float(temp),
+                max_tokens=int(mt),
+                api_key=self.spec.resolve_api_key() or "",
+                timeout=float(self.spec.request_timeout),
+                extra=merged_extra or None,
+            )
+            self.pool.mark_success(url)
+            return upstream
         except Exception:
             self.pool.mark_failure(url)
             raise
