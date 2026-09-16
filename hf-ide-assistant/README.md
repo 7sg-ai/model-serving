@@ -111,6 +111,20 @@ Edit `~/.continue/config.json`:
 }
 ```
 
+
+## IDE tool passthrough (Cline / Cursor)
+
+This server **forwards** OpenAI-style `tools` / `tool_choice` to the upstream NIM or vLLM backend and
+returns `tool_calls` in JSON and SSE. The **IDE executes** tools (read_file, apply_diff, terminal, …);
+this process does not run workspace tools itself.
+
+When `tools` are present:
+- Response cache and aggressive conversation-memory merge are skipped so the client tool loop stays intact
+- Switchyard multi-step escalation is bypassed for that turn (single-model passthrough)
+- A short system nudge (`IDE_TOOL_NUDGE=true`) encourages the model to call tools instead of asking for pasted code
+
+Model quality still matters: small non-tool-tuned instruct models may ignore tools even when schemas are forwarded.
+
 ## API Endpoints
 
 ### List Models
@@ -157,7 +171,7 @@ GET /health
 
 Edit `.env` file:
 
-- `HF_MODEL_NAME` / `VLLM_MODEL`: model id **must match** vLLM `--model` (default: meta-llama/Llama-3.1-8B-Instruct)
+- `HF_MODEL_NAME` / `VLLM_MODEL`: model id **must match** vLLM `--model` (fallback default: Qwen/Qwen2.5-Coder-32B-Instruct; .env default: moonshotai/Kimi-K3)
 - `BACKEND_URLS` or `VLLM_API_URL`: required vLLM chat completions endpoint(s)
 - `MODEL_DEPLOY_MODE`: `hybrid` | `replica` | `sharded` (placement metadata; GPUs/TP set on vLLM)
 
@@ -256,10 +270,13 @@ CONTEXT_WINDOW=2048
 **Default:**
 - `moonshotai/Kimi-K3` - Moonshot Kimi K3 (2.8T MoE / ~104B active, **1M context**) — best for complicated multi-file coding
 
-**Lighter alternatives:**
-- `mistralai/Mistral-7B-Instruct-v0.1` - 7B parameters
-- `meta-llama/Llama-2-7b-chat-hf` - 7B parameters (requires HF token)
-- `Salesforce/codegen-2B-mono` - Code generation focused
+**Lighter / alternative tool-capable options:**
+- `Qwen/Qwen2.5-Coder-32B-Instruct` - Tool-capable coding model (OpenAI function calling via vLLM)
+- `Qwen/Qwen2.5-Coder-7B-Instruct` - Small tool-capable option
+- `meta-llama/Llama-3.3-70B-Instruct` - Function-calling tuned Llama (requires HF token)
+- `Qwen/Qwen3-32B` - Tool-capable reasoning model
+
+**Not recommended for IDE agent loops** (no/weak tool calling): Mistral-7B-Instruct, Llama-3.1-8B, CodeLlama, codegen — they tend to answer in prose and ignore tool schemas.
 - `microsoft/DialoGPT-medium` - Small conversational baseline (not ideal for coding)
 
 

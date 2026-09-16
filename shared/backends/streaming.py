@@ -3,6 +3,9 @@ OpenAI-compatible SSE (Server-Sent Events) streaming helpers.
 
 Cline and most IDE clients send chat.completions with stream=true and expect
 text/event-stream bodies. Proxies must not call response.json() on SSE.
+
+Tool calling: upstream may emit delta.tool_calls; SSE bytes are proxied
+unchanged. Synthesized SSE from full completions includes tool_calls.
 """
 from __future__ import annotations
 
@@ -223,17 +226,27 @@ def completion_to_sse_chunks(
     model: Optional[str] = None,
     chunk_chars: int = 48,
 ) -> Iterator[str]:
-    """Convert a non-stream chat.completion JSON body into SSE chunk lines."""
+    """Convert a non-stream chat.completion JSON body into SSE chunk lines.
+
+    Emits delta.tool_calls when the completion message includes tool_calls so
+    IDE clients can run tools even on the synthesize-SSE path.
+    """
     created = int(result.get("created") or time.time())
     resp_id = result.get("id") or f"chatcmpl-{created}"
     model_out = model or result.get("model") or "unknown"
     text = ""
     finish_reason = "stop"
+    tool_calls: List[Dict[str, Any]] = []
     try:
         choice0 = result["choices"][0]
         finish_reason = choice0.get("finish_reason") or "stop"
         msg = choice0.get("message") or {}
         text = msg.get("content") or choice0.get("text") or ""
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list):
+            tool_calls = tcs
+            if finish_reason in (None, "", "stop"):
+                finish_reason = "tool_calls"
     except (KeyError, IndexError, TypeError):
         text = ""
 
@@ -249,15 +262,61 @@ def completion_to_sse_chunks(
     if not isinstance(text, str):
         text = str(text or "")
 
-    step = max(1, int(chunk_chars))
-    for i in range(0, len(text), step):
-        piece = text[i : i + step]
+    # Prefer content first, then tool_calls (OpenAI-compatible)
+    if text and not tool_calls:
+        step = max(1, int(chunk_chars))
+        for i in range(0, len(text), step):
+            piece = text[i : i + step]
+            chunk = {
+                "id": resp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_out,
+                "choices": [
+                    {"index": 0, "delta": {"content": piece}, "finish_reason": None}
+                ],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    elif text and tool_calls:
+        step = max(1, int(chunk_chars))
+        for i in range(0, len(text), step):
+            piece = text[i : i + step]
+            chunk = {
+                "id": resp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_out,
+                "choices": [
+                    {"index": 0, "delta": {"content": piece}, "finish_reason": None}
+                ],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    for i, tc in enumerate(tool_calls):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        delta_tc = {
+            "index": int(tc.get("index", i)),
+            "id": tc.get("id") or f"call_{i}",
+            "type": tc.get("type") or "function",
+            "function": {
+                "name": fn.get("name") or "",
+                "arguments": fn.get("arguments") or "",
+            },
+        }
         chunk = {
             "id": resp_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model_out,
-            "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [delta_tc]},
+                    "finish_reason": None,
+                }
+            ],
         }
         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 

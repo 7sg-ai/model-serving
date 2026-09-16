@@ -107,6 +107,24 @@ Visit [NVIDIA NGC Catalog](https://catalog.ngc.nvidia.com/) for available NIM mo
 
 
 
+## Internet search + URL fetch
+
+When a user message **asks to search** (e.g. "search the web for …", "look up …", or `/search …`),
+the app queries **DuckDuckGo HTML** (no API key), optionally fetches the top result pages, and
+injects titles/URLs/snippets into the model context.
+
+When a message contains explicit `http://` or `https://` URLs, those pages are still fetched and logged
+(see original Internet access tool behavior below).
+
+```bash
+WEB_SEARCH_ENABLED=true
+WEB_SEARCH_MAX_RESULTS=5
+WEB_SEARCH_FETCH_TOP=2
+WEB_SEARCH_FETCH_PAGES=true
+```
+
+Requires outbound HTTPS egress from the deployment. Disable with `WEB_SEARCH_ENABLED=false`.
+
 ## Internet access tool
 
 When a user message contains `http://` or `https://` URLs, the app:

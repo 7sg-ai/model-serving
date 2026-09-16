@@ -25,11 +25,18 @@ from shared.cache import (
 )
 from shared.backends import (
     OpenAIChatClient,
+    apply_ide_tool_nudge,
+    build_tools_extra,
+    warn_if_not_tool_capable,
     flask_sse_from_completion,
     flask_sse_from_upstream,
+    message_content_for_memory,
     normalize_chat_url,
     post_chat_stream,
     require_backend_urls,
+    request_has_tools,
+    should_bypass_memory_merge,
+    should_skip_response_cache,
 )
 
 from shared.deploy import ensure_models_runtime
@@ -63,8 +70,9 @@ os.environ.setdefault("LOAD_MODEL_WEIGHTS", "false")
 
 # Configuration
 MODEL_NAME = os.getenv(
-    "HF_MODEL_NAME", os.getenv("VLLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+    "HF_MODEL_NAME", os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct")
 )
+warn_if_not_tool_capable(MODEL_NAME, app_name="hf-ide-assistant")
 API_KEY = os.getenv("API_KEY", "hf-coding-assistant-key")
 VLLM_API_KEY = os.getenv("VLLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 REQUEST_TIMEOUT = float(os.getenv("VLLM_TIMEOUT", os.getenv("REQUEST_TIMEOUT", "300")))
@@ -274,13 +282,14 @@ def merge_with_memory(conversation_id, messages, max_tokens, context_window=None
         conversation_memory.context_window = original_window
 
 
-def generate_response(messages, max_tokens, temperature, model_id=None):
+def generate_response(messages, max_tokens, temperature, model_id=None, extra=None):
     """Generate via vLLM OpenAI-compatible HTTP."""
     data, text = VLLM_CLIENT.chat(
         messages,
         model=model_id or MODEL_NAME,
         temperature=temperature,
         max_tokens=max_tokens,
+        extra=extra,
     )
     prompt_tokens, completion_tokens = VLLM_CLIENT.usage_tuple(data)
     return text, prompt_tokens, completion_tokens, data
@@ -346,6 +355,10 @@ def chat_completions():
     max_tokens = max(1, min(max_tokens, EFFECTIVE_CONTEXT_WINDOW - 64))
     stream = bool(data.get("stream", False))
     requested_model = data.get("model") or MODEL_NAME
+    tools = data.get("tools")
+    tool_choice = data.get("tool_choice")
+    parallel_tool_calls = data.get("parallel_tool_calls")
+    tools_extra = build_tools_extra(tools, tool_choice, parallel_tool_calls)
 
     conversation_id = (
         request.headers.get("X-Conversation-ID")
@@ -367,15 +380,20 @@ def chat_completions():
             )
             max_tokens = max(1, min(max_tokens, ctx_window - 64))
 
-    messages = merge_with_memory(
-        conversation_id, messages, max_tokens, context_window=ctx_window
-    )
+    if should_bypass_memory_merge(tools, messages):
+        messages = apply_ide_tool_nudge(list(messages or []), tools)
+        if not messages or messages[0].get("role") != "system":
+            messages = ensure_system_message(messages)
+    else:
+        messages = merge_with_memory(
+            conversation_id, messages, max_tokens, context_window=ctx_window
+        )
 
     cache_model = requested_model or MODEL_NAME
     if SY_CFG.enabled:
         cache_model = f"sy:{SY_CFG.strategy}:{cache_model}"
     cache_key = None
-    if not stream:
+    if not should_skip_response_cache(tools, messages, stream=bool(stream)):
         cache_key = response_cache.make_key(
             cache_model, messages, temperature, max_tokens
         )
@@ -397,6 +415,7 @@ def chat_completions():
                     temperature=temperature,
                     max_tokens=max_tokens,
                     session_id=conversation_id,
+                    extra=tools_extra or None,
                 )
                 if outcome.is_live_stream:
                     return flask_sse_from_upstream(
@@ -440,6 +459,7 @@ def chat_completions():
                     max_tokens=max_tokens,
                     api_key=VLLM_API_KEY,
                     timeout=float(REQUEST_TIMEOUT),
+                    extra=tools_extra or None,
                 )
                 CLUSTER.backend_pool.mark_success(backend)
             except Exception:
@@ -454,8 +474,10 @@ def chat_completions():
                 temperature=temperature,
                 max_tokens=max_tokens,
                 session_id=conversation_id,
+                extra=tools_extra or None,
             )
-            remember_exchange(conversation_id, messages, response_text)
+            if response_text and not should_bypass_memory_merge(tools, messages):
+                remember_exchange(conversation_id, messages, response_text)
             if isinstance(result, dict):
                 result = dict(result)
                 result["cached"] = False
@@ -463,8 +485,12 @@ def chat_completions():
                 response_cache.set(cache_key, result)
             return jsonify(result)
 
-        response_text, prompt_tokens, completion_tokens, _raw = generate_response(
-            messages, max_tokens, temperature, model_id=requested_model
+        response_text, prompt_tokens, completion_tokens, raw = generate_response(
+            messages,
+            max_tokens,
+            temperature,
+            model_id=requested_model,
+            extra=tools_extra or None,
         )
     except Exception as e:
         return (
@@ -480,7 +506,22 @@ def chat_completions():
             500,
         )
 
-    remember_exchange(conversation_id, messages, response_text)
+    # Prefer upstream body when tool_calls present so IDE clients see them
+    if isinstance(raw, dict) and (
+        (raw.get("choices") or [{}])[0].get("message", {}).get("tool_calls")
+        or tools_extra
+    ):
+        result = dict(raw)
+        result["cached"] = False
+        if cache_key is not None and not request_has_tools(tools):
+            response_cache.set(cache_key, result)
+        content = message_content_for_memory(result)
+        if content and not should_bypass_memory_merge(tools, messages):
+            remember_exchange(conversation_id, messages, content)
+        return jsonify(result)
+
+    if response_text and not should_bypass_memory_merge(tools, messages):
+        remember_exchange(conversation_id, messages, response_text)
 
     result = {
         "id": "chatcmpl-" + str(int(datetime.now().timestamp())),

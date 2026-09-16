@@ -11,12 +11,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.auth import AuthManager
 from shared.database import ChatHistory
 from shared.multinode import BackendPool, ClusterInfo, get_multinode_config
-from shared.tools import get_web_access_tool
+from shared.tools import get_web_access_tool, get_web_enricher
 from shared.model_catalog import deploy_app_models, load_app_models
 
 MN_CFG = get_multinode_config(default_port=8501, app_name="nim-streamlit-chat")
 CLUSTER = ClusterInfo(MN_CFG, app_name="nim-streamlit-chat")
 WEB = get_web_access_tool("nim-streamlit-chat")
+ENRICH = get_web_enricher("nim-streamlit-chat")
 
 NIM_API_URL = os.getenv("NIM_API_URL", "http://localhost:8000/v1/chat/completions")
 DEFAULT_MODEL_NAME = os.getenv("NIM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
@@ -200,14 +201,32 @@ def chat_page():
             or st.session_state.username
             or "guest"
         )
-        model_messages, web_results = WEB.enrich_messages(
+        model_messages, enrichment = ENRICH.enrich_messages(
             st.session_state.messages,
             user_text=prompt,
             session_id=session_key,
         )
-        if web_results:
-            with st.expander(f"🌐 Fetched {len(web_results)} URL(s) (full content logged)"):
-                for wr in web_results:
+        if enrichment.search_results or enrichment.search_error:
+            with st.expander(
+                f"🔍 Web search: {enrichment.query or '(none)'} "
+                f"({len(enrichment.search_results)} hit(s))"
+            ):
+                if enrichment.search_error and not enrichment.search_results:
+                    st.warning(enrichment.search_error)
+                for row in enrichment.ui_search_rows():
+                    title = row.get("title") or ""
+                    url = row.get("url") or ""
+                    snip = row.get("snippet") or ""
+                    line = "- **" + title + "** — `" + url + "`"
+                    if snip:
+                        line = line + "\n  " + snip
+                    st.markdown(line)
+
+        if enrichment.fetch_results:
+            with st.expander(
+                f"🌐 Fetched {len(enrichment.fetch_results)} URL(s) (full content logged)"
+            ):
+                for wr in enrichment.fetch_results:
                     st.markdown(
                         f"- `{wr.url}` — "
                         f"{'OK' if wr.ok else 'FAIL'} "

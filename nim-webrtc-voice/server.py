@@ -20,7 +20,7 @@ from shared.multinode import (
     get_multinode_config,
     run_socketio_app,
 )
-from shared.tools import get_web_access_tool
+from shared.tools import get_web_access_tool, get_web_enricher
 from shared.model_catalog import deploy_app_models, load_app_models
 
 app = Flask(__name__)
@@ -64,6 +64,7 @@ MODEL_NAME = CATALOG.default_id()
 auth_manager = AuthManager()
 chat_history = ChatHistory()
 WEB = get_web_access_tool("nim-webrtc-voice")
+ENRICH = get_web_enricher("nim-webrtc-voice")
 
 print(f"NIM voice models: {[m.id for m in CATALOG.models]}")
 
@@ -219,28 +220,25 @@ def handle_voice_message(data):
         chat_history.add_message(conv["id"], "user", text)
 
     session_key = str(conv.get("id") or request.sid)
-    model_messages, web_results = WEB.enrich_messages(
+    model_messages, enrichment = ENRICH.enrich_messages(
         conv["messages"],
         user_text=text,
         session_id=session_key,
     )
-    if web_results:
+    if enrichment.search_results or enrichment.search_error:
+        emit(
+            "web_search",
+            {
+                "query": enrichment.query,
+                "error": enrichment.search_error or None,
+                "results": enrichment.ui_search_rows(),
+            },
+        )
+    if enrichment.fetch_results:
         emit(
             "web_fetch",
             {
-                "urls": [
-                    {
-                        "url": wr.url,
-                        "ok": wr.ok,
-                        "status_code": wr.status_code,
-                        "title": wr.title,
-                        "log_path": wr.log_path,
-                        "content_sha256": wr.content_sha256,
-                        "raw_length": wr.raw_length,
-                        "error": wr.error,
-                    }
-                    for wr in web_results
-                ],
+                "urls": enrichment.ui_fetch_rows(),
                 "log_file": WEB.log_file_path,
             },
         )

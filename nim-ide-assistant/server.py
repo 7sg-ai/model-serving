@@ -23,9 +23,16 @@ from shared.auth import AuthManager
 from shared.database import ChatHistory
 from shared.cache import ResponseCache, ConversationMemory
 from shared.backends import (
+    apply_ide_tool_nudge,
+    build_tools_extra,
+    warn_if_not_tool_capable,
     flask_sse_from_completion,
     flask_sse_from_upstream,
+    message_content_for_memory,
     post_chat_stream,
+    request_has_tools,
+    should_bypass_memory_merge,
+    should_skip_response_cache,
 )
 from shared.multinode import (
     BackendPool,
@@ -52,7 +59,9 @@ CLUSTER = ClusterInfo(MN_CFG, app_name="nim-ide-assistant")
 
 # Configuration
 NIM_API_URL = os.getenv("NIM_API_URL", "http://localhost:8000/v1/chat/completions")
-MODEL_NAME = os.getenv("NIM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
+# Default: tool-capable coding model (Qwen2.5-Coder NIM) so Cline/Cursor tool loops work
+MODEL_NAME = os.getenv("NIM_MODEL_NAME", "qwen/qwen2.5-coder-32b-instruct")
+warn_if_not_tool_capable(MODEL_NAME, app_name="nim-ide-assistant")
 API_KEY = os.getenv("API_KEY", "nim-coding-assistant-key")
 # Multi-model deploy happens after Switchyard config is loaded (see below).
 
@@ -231,11 +240,14 @@ def remember_exchange(conversation_id, messages, assistant_content):
         pass
 
 
-def _legacy_upstream_chat(messages, temperature, max_tokens, stream, model_name):
+def _legacy_upstream_chat(
+    messages, temperature, max_tokens, stream, model_name, extra=None
+):
     """Single-backend NIM path (Switchyard disabled).
 
     When stream=True, returns a live requests.Response (SSE) that the caller
     must proxy; when stream=False, returns the parsed OpenAI JSON body.
+    `extra` may include tools / tool_choice for IDE agent loops.
     """
     backend = CLUSTER.next_backend() or NIM_API_URL
     try:
@@ -247,6 +259,7 @@ def _legacy_upstream_chat(messages, temperature, max_tokens, stream, model_name)
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=float(REQUEST_TIMEOUT),
+                extra=extra,
             )
             CLUSTER.backend_pool.mark_success(backend)
             return upstream
@@ -257,6 +270,9 @@ def _legacy_upstream_chat(messages, temperature, max_tokens, stream, model_name)
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if extra:
+            nim_payload.update(extra)
+            nim_payload["stream"] = False
         response = requests.post(backend, json=nim_payload, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         CLUSTER.backend_pool.mark_success(backend)
@@ -314,6 +330,10 @@ def chat_completions():
         or data.get("user")
         or data.get("conversation_id")
     )
+    tools = data.get("tools")
+    tool_choice = data.get("tool_choice")
+    parallel_tool_calls = data.get("parallel_tool_calls")
+    tools_extra = build_tools_extra(tools, tool_choice, parallel_tool_calls)
 
     # Cap max_tokens so prompt + completion fit the context window
     max_tokens = max(1, min(max_tokens, CONTEXT_WINDOW - 512))
@@ -328,16 +348,22 @@ def chat_completions():
             ctx_window = spec.context_window or CONTEXT_WINDOW
             max_tokens = max(1, min(max_tokens, ctx_window - 512))
 
-    messages = merge_with_memory(
-        conversation_id, messages, max_tokens, context_window=ctx_window
-    )
+    # Tool loops: keep client transcript intact (Cline owns tool_calls / tool results)
+    if should_bypass_memory_merge(tools, messages):
+        messages = apply_ide_tool_nudge(list(messages or []), tools)
+        if not messages or messages[0].get("role") != "system":
+            messages = ensure_system_message(messages)
+    else:
+        messages = merge_with_memory(
+            conversation_id, messages, max_tokens, context_window=ctx_window
+        )
 
-    # Response cache (skip streaming — not cacheable as a single JSON body)
+    # Response cache (skip streaming and any tool-protocol turns)
     cache_model = requested_model or MODEL_NAME
     if SY_CFG.enabled:
         cache_model = f"sy:{SY_CFG.strategy}:{cache_model}"
     cache_key = None
-    if not stream:
+    if not should_skip_response_cache(tools, messages, stream=bool(stream)):
         cache_key = response_cache.make_key(
             cache_model, messages, temperature, max_tokens
         )
@@ -362,6 +388,7 @@ def chat_completions():
                     temperature=float(temperature),
                     max_tokens=int(max_tokens),
                     session_id=conversation_id or "default",
+                    extra=tools_extra or None,
                 )
                 if outcome.is_live_stream:
                     return flask_sse_from_upstream(
@@ -391,7 +418,12 @@ def chat_completions():
                 )
 
             upstream = _legacy_upstream_chat(
-                messages, temperature, max_tokens, True, MODEL_NAME
+                messages,
+                temperature,
+                max_tokens,
+                True,
+                MODEL_NAME,
+                extra=tools_extra or None,
             )
             return flask_sse_from_upstream(upstream, on_complete=_on_complete)
 
@@ -403,16 +435,23 @@ def chat_completions():
                 max_tokens=int(max_tokens),
                 session_id=conversation_id or "default",
                 stream=False,
+                extra=tools_extra or None,
             )
-            if assistant_content:
+            if assistant_content and not should_bypass_memory_merge(tools, messages):
                 remember_exchange(conversation_id, messages, assistant_content)
         else:
             result = _legacy_upstream_chat(
-                messages, temperature, max_tokens, False, MODEL_NAME
+                messages,
+                temperature,
+                max_tokens,
+                False,
+                MODEL_NAME,
+                extra=tools_extra or None,
             )
             try:
-                assistant_content = result["choices"][0]["message"]["content"]
-                remember_exchange(conversation_id, messages, assistant_content)
+                assistant_content = message_content_for_memory(result)
+                if assistant_content and not request_has_tools(tools):
+                    remember_exchange(conversation_id, messages, assistant_content)
             except (KeyError, IndexError, TypeError):
                 pass
 

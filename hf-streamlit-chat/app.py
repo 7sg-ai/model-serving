@@ -13,7 +13,7 @@ from shared.auth import AuthManager
 from shared.database import ChatHistory
 from shared.backends import require_backend_urls
 from shared.multinode import BackendPool, ClusterInfo, get_multinode_config
-from shared.tools import get_web_access_tool
+from shared.tools import get_web_access_tool, get_web_enricher
 from shared.model_catalog import deploy_app_models, load_app_models
 
 os.environ.setdefault("LOAD_MODEL_WEIGHTS", "false")
@@ -21,6 +21,7 @@ os.environ.setdefault("LOAD_MODEL_WEIGHTS", "false")
 MN_CFG = get_multinode_config(default_port=8501, app_name="hf-streamlit-chat")
 CLUSTER = ClusterInfo(MN_CFG, app_name="hf-streamlit-chat")
 WEB = get_web_access_tool("hf-streamlit-chat")
+ENRICH = get_web_enricher("hf-streamlit-chat")
 
 DEFAULT_MODEL_NAME = os.getenv(
     "HF_MODEL_NAME", os.getenv("VLLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
@@ -225,10 +226,26 @@ def chat_page():
             or st.session_state.username
             or "guest"
         )
-        web_results, web_context = WEB.process_user_text(prompt, session_id=session_key)
-        if web_results:
-            with st.expander(f"Fetched {len(web_results)} URL(s) (full content logged)"):
-                for wr in web_results:
+        enrichment = ENRICH.enrich_user_text(prompt, session_id=session_key)
+        web_context = enrichment.context
+        if enrichment.search_results or enrichment.search_error:
+            with st.expander(
+                f"Web search: {enrichment.query or '(none)'} "
+                f"({len(enrichment.search_results)} hit(s))"
+            ):
+                if enrichment.search_error and not enrichment.search_results:
+                    st.warning(enrichment.search_error)
+                for row in enrichment.ui_search_rows():
+                    title = row.get("title") or ""
+                    url = row.get("url") or ""
+                    snip = row.get("snippet") or ""
+                    st.markdown("- **" + title + "** — `" + url + "`\n  " + snip)
+
+        if enrichment.fetch_results:
+            with st.expander(
+                f"Fetched {len(enrichment.fetch_results)} URL(s) (full content logged)"
+            ):
+                for wr in enrichment.fetch_results:
                     st.markdown(
                         f"- `{wr.url}` — "
                         f"{'OK' if wr.ok else 'FAIL'} "

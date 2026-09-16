@@ -26,10 +26,10 @@ An OpenAI-compatible API server that connects NIM models to IDEs like Cline and 
 ```bash
 docker run -d \
   --gpus all \
-  --name nim-llama \
+  --name nim-qwen \
   -p 8000:8000 \
   -e NGC_API_KEY=your_ngc_api_key \
-  nvcr.io/nim/meta/llama-3.1-8b-instruct:latest
+  nvcr.io/nim/qwen/qwen2.5-coder-32b-instruct:latest
 ```
 
 ### 2. Install Python Dependencies
@@ -71,7 +71,7 @@ The server will start on port 8080 and display configuration details.
    - **API Provider**: OpenAI Compatible
    - **Base URL**: `http://localhost:8080/v1`
    - **API Key**: `nim-coding-assistant-key` (or your custom key from .env)
-   - **Model**: `meta/llama-3.1-8b-instruct` (or your configured model)
+   - **Model**: `qwen/qwen2.5-coder-32b-instruct` (or your configured model)
 
 ### For Cursor
 
@@ -81,7 +81,7 @@ The server will start on port 8080 and display configuration details.
    - **Provider**: OpenAI Compatible
    - **Base URL**: `http://localhost:8080/v1`
    - **API Key**: `nim-coding-assistant-key`
-   - **Model ID**: `meta/llama-3.1-8b-instruct`
+   - **Model ID**: `qwen/qwen2.5-coder-32b-instruct`
 
 ### For Continue (VS Code Extension)
 
@@ -91,15 +91,29 @@ Edit `~/.continue/config.json`:
 {
   "models": [
     {
-      "title": "NIM Llama",
+      "title": "NIM Qwen2.5-Coder",
       "provider": "openai",
-      "model": "meta/llama-3.1-8b-instruct",
+      "model": "qwen/qwen2.5-coder-32b-instruct",
       "apiBase": "http://localhost:8080/v1",
       "apiKey": "nim-coding-assistant-key"
     }
   ]
 }
 ```
+
+
+## IDE tool passthrough (Cline / Cursor)
+
+This server **forwards** OpenAI-style `tools` / `tool_choice` to the upstream NIM or vLLM backend and
+returns `tool_calls` in JSON and SSE. The **IDE executes** tools (read_file, apply_diff, terminal, …);
+this process does not run workspace tools itself.
+
+When `tools` are present:
+- Response cache and aggressive conversation-memory merge are skipped so the client tool loop stays intact
+- Switchyard multi-step escalation is bypassed for that turn (single-model passthrough)
+- A short system nudge (`IDE_TOOL_NUDGE=true`) encourages the model to call tools instead of asking for pasted code
+
+Model quality still matters: small non-tool-tuned instruct models may ignore tools even when schemas are forwarded.
 
 ## API Endpoints
 
@@ -116,7 +130,7 @@ Authorization: Bearer nim-coding-assistant-key
 Content-Type: application/json
 
 {
-  "model": "meta/llama-3.1-8b-instruct",
+  "model": "qwen/qwen2.5-coder-32b-instruct",
   "messages": [
     {"role": "user", "content": "Write a Python function to sort a list"}
   ]
@@ -130,7 +144,7 @@ Authorization: Bearer nim-coding-assistant-key
 Content-Type: application/json
 
 {
-  "model": "meta/llama-3.1-8b-instruct",
+  "model": "qwen/qwen2.5-coder-32b-instruct",
   "prompt": "def fibonacci(n):",
   "max_tokens": 100
 }
@@ -219,9 +233,10 @@ CONTEXT_WINDOW=8192
 
 ## Recommended NIM Models for Coding
 
-- **meta/llama-3.1-8b-instruct** - Good balance of speed and quality
-- **meta/llama-3.1-70b-instruct** - Higher quality, requires more resources
-- **codellama/CodeLlama-34b-Instruct-hf** - Specialized for coding tasks
+- **qwen/qwen2.5-coder-32b-instruct** (default) - Tool-capable coding model; OpenAI tool calling for Cline/Cursor loops
+- **qwen/qwen3-235b-a22b** - Strong tool-capable MoE for hard multi-file tasks (Switchyard strong tier)
+- **meta/llama-3.3-70b-instruct** - Function-calling tuned Llama; alternative strong tier
+- **qwen/qwen2.5-coder-7b-instruct** - Small tool-capable option for limited GPUs
 
 ## Usage Examples
 
@@ -301,7 +316,7 @@ Or set tiers via env (`SWITCHYARD_WEAK_*`, `SWITCHYARD_STRONG_*`, `SWITCHYARD_JU
 | IDE model field | Behavior |
 |-----------------|----------|
 | `switchyard/agent` | Escalation route (weak first, latch to strong) |
-| `meta/llama-3.1-8b-instruct` (etc.) | Direct to that model’s backend |
+| `qwen/qwen2.5-coder-32b-instruct` (etc.) | Direct to that model’s backend |
 
 ```bash
 curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/v1/models

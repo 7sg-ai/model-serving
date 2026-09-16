@@ -13,7 +13,7 @@
 #    Do not run a second GPU NIM alongside hf-streamlit-chat (TDF maxGPUs: 1).
 #  - AUTO_DEPLOY_MODEL must stay false so ide-api does not docker-run another NIM.
 #  - API_KEY (secret ide-api-key) authenticates IDE clients. NGC_API_KEY
-#    (secret ngc-api-key) pulls/serves Llama weights for nim-server.
+#    (secret ngc-api-key) pulls/serves Qwen2.5-Coder weights for nim-server.
 #  - API_KEY (secret ide-api-key) authenticates IDE clients. Value lives in
 #    the org Vault under this exact name.
 #  - The gcp-gpu-vm scenario is an alternate (v2 schema allows only
@@ -45,7 +45,7 @@ secrets:
       envVar: API_KEY
       source_type: internal_value
       internalRef: ide-api-key
-    # NIM model server needs an NGC API key to download/serve Llama weights.
+    # NIM model server needs an NGC API key to download/serve Qwen2.5-Coder weights.
     - name: ngc-api-key
       injectAs: env
       envVar: NGC_API_KEY
@@ -78,7 +78,7 @@ scenarios:
           - name: NIM_API_URL
             value: http://nim-llama:8000/v1/chat/completions
           - name: NIM_MODEL_NAME
-            value: meta/llama-3.1-8b-instruct
+            value: qwen/qwen2.5-coder-32b-instruct
           - name: AUTO_DEPLOY_MODEL
             value: 'false'
           - name: MAX_TOKENS
@@ -132,7 +132,7 @@ scenarios:
           regions:
           - us-central1
           image:
-            repository: nvcr.io/nim/meta/llama-3.1-8b-instruct
+            repository: nvcr.io/nim/qwen/qwen2.5-coder-32b-instruct
             tag: latest
           resources:
             cpu: '4'
@@ -148,7 +148,7 @@ scenarios:
               target: 70
           env:
           - name: NIM_MODEL_NAME
-            value: meta/llama-3.1-8b-instruct
+            value: qwen/qwen2.5-coder-32b-instruct
           envFromSecretRefs:
           - ngc-api-key
         endpoints:
@@ -185,7 +185,7 @@ scenarios:
           - name: BACKEND_STRATEGY
             value: round_robin
           - name: NIM_MODEL_NAME
-            value: meta/llama-3.1-8b-instruct
+            value: qwen/qwen2.5-coder-32b-instruct
           - name: LOAD_MODEL_WEIGHTS
             value: 'false'
           - name: AUTO_DEPLOY_MODEL
@@ -245,7 +245,7 @@ scenarios:
           - name: NIM_API_URL
             value: http://nim-llama:8000/v1/chat/completions
           - name: NIM_MODEL_NAME
-            value: meta/llama-3.1-8b-instruct
+            value: qwen/qwen2.5-coder-32b-instruct
           - name: AUTO_DEPLOY_MODEL
             value: 'false'
           - name: MAX_TOKENS

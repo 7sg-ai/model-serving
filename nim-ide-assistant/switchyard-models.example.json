@@ -12,7 +12,7 @@
   "models": [
     {
       "name": "weak",
-      "id": "meta/llama-3.1-8b-instruct",
+      "id": "qwen/qwen2.5-coder-32b-instruct",
       "role": "weak",
       "max_tokens": 8192,
       "temperature": 0.3,
@@ -22,13 +22,13 @@
         "backend_url": "http://localhost:8000/v1/chat/completions",
         "cuda_visible_devices": "0",
         "gpu_count": 1,
-        "nim_image": "nvcr.io/nim/meta/llama-3.1-8b-instruct:latest",
+        "nim_image": "nvcr.io/nim/qwen/qwen2.5-coder-32b-instruct:latest",
         "deploy_mode": "replica"
       }
     },
     {
       "name": "strong",
-      "id": "meta/llama-3.1-70b-instruct",
+      "id": "qwen/qwen3-235b-a22b",
       "role": "strong",
       "max_tokens": 32768,
       "temperature": 0.3,
@@ -42,13 +42,13 @@
         "tensor_parallel_size": 4,
         "cuda_visible_devices": "1,2,3,4",
         "gpu_count": 4,
-        "nim_image": "nvcr.io/nim/meta/llama-3.1-70b-instruct:latest",
+        "nim_image": "nvcr.io/nim/qwen/qwen3-235b-a22b:latest",
         "deploy_mode": "hybrid"
       }
     },
     {
       "name": "judge",
-      "id": "meta/llama-3.1-8b-instruct",
+      "id": "qwen/qwen2.5-coder-32b-instruct",
       "role": "judge",
       "max_tokens": 1024,
       "temperature": 0.0,

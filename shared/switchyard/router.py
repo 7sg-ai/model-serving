@@ -169,6 +169,7 @@ class SwitchyardRouter:
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], str]:
         if self.local_generate and (
             spec.deployment.load_weights_locally or not spec.chat_url()
@@ -216,7 +217,9 @@ class SwitchyardRouter:
                     )
                     client = ModelClient(tmp)
 
-        result = client.chat(messages, temperature=temperature, max_tokens=max_tokens)
+        result = client.chat(
+            messages, temperature=temperature, max_tokens=max_tokens, extra=extra
+        )
         return result, client.extract_assistant_text(result)
 
     def _external_chat_url(self) -> str:
@@ -389,6 +392,59 @@ class SwitchyardRouter:
         }
         return resp, text, pick
 
+
+    def _tools_in_extra(self, extra: Optional[Dict[str, Any]]) -> bool:
+        if not extra:
+            return False
+        tools = extra.get("tools")
+        return isinstance(tools, list) and len(tools) > 0
+
+    def _direct_with_extra(
+        self,
+        spec: ModelSpec,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        extra: Optional[Dict[str, Any]],
+        route: str = "direct",
+    ) -> Tuple[Dict[str, Any], str, ModelSpec]:
+        temp = spec.temperature if temperature is None else float(temperature)
+        mt = spec.max_tokens if max_tokens is None else int(max_tokens)
+        mt = max(1, min(mt, spec.context_window - 512))
+        resp, text = self._call_spec(spec, messages, temp, mt, extra=extra)
+        resp = dict(resp)
+        resp["switchyard"] = {
+            "route": route,
+            "served_by": spec.name,
+            "model_id": spec.id,
+            "tools_passthrough": bool(self._tools_in_extra(extra)),
+        }
+        return resp, text, spec
+
+    def _stream_with_extra(
+        self,
+        spec: ModelSpec,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        extra: Optional[Dict[str, Any]],
+        route: str = "direct",
+    ) -> StreamOutcome:
+        temp = spec.temperature if temperature is None else float(temperature)
+        mt = spec.max_tokens if max_tokens is None else int(max_tokens)
+        mt = max(1, min(mt, spec.context_window - 512))
+        upstream = self._open_spec_stream(spec, messages, temp, mt, extra=extra)
+        return StreamOutcome(
+            upstream=upstream,
+            served=spec,
+            meta={
+                "route": route,
+                "served_by": spec.name,
+                "model_id": spec.id,
+                "tools_passthrough": bool(self._tools_in_extra(extra)),
+            },
+        )
+
     # ----- main entry -----
 
     def chat_completions(
@@ -437,17 +493,28 @@ class SwitchyardRouter:
             spec = self.resolve_spec(requested_model)
             if spec is None:
                 raise RuntimeError(f"Unknown model: {requested_model}")
-            temp = spec.temperature if temperature is None else float(temperature)
-            mt = spec.max_tokens if max_tokens is None else int(max_tokens)
-            mt = max(1, min(mt, spec.context_window - 512))
-            resp, text = self._call_spec(spec, messages, temp, mt)
-            resp = dict(resp)
-            resp["switchyard"] = {
-                "route": "direct",
-                "served_by": spec.name,
-                "model_id": spec.id,
-            }
-            return resp, text, spec
+            return self._direct_with_extra(
+                spec, messages, temperature, max_tokens, extra, route="direct"
+            )
+
+        # IDE tool loops: skip multi-step escalation/capability judge so tools
+        # round-trip on a single known upstream model.
+        if self._tools_in_extra(extra):
+            spec = (
+                self.cfg.default_model()
+                or self.cfg.weak()
+                or (self.cfg.selectable_models()[0] if self.cfg.selectable_models() else None)
+            )
+            if not spec:
+                raise RuntimeError("No models configured for tools passthrough")
+            return self._direct_with_extra(
+                spec,
+                messages,
+                temperature,
+                max_tokens,
+                extra,
+                route="tools_passthrough",
+            )
 
         # Strategy routes
         strategy = self.cfg.strategy
@@ -483,17 +550,9 @@ class SwitchyardRouter:
         spec = self.cfg.default_model()
         if not spec:
             raise RuntimeError("No models configured")
-        temp = spec.temperature if temperature is None else float(temperature)
-        mt = spec.max_tokens if max_tokens is None else int(max_tokens)
-        mt = max(1, min(mt, spec.context_window - 512))
-        resp, text = self._call_spec(spec, messages, temp, mt)
-        resp = dict(resp)
-        resp["switchyard"] = {
-            "route": "passthrough",
-            "served_by": spec.name,
-            "model_id": spec.id,
-        }
-        return resp, text, spec
+        return self._direct_with_extra(
+            spec, messages, temperature, max_tokens, extra, route="passthrough"
+        )
 
 
     def _capability_pick(
@@ -563,6 +622,7 @@ class SwitchyardRouter:
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
         if self.local_generate is not None and not (
             spec.deployment.backend_urls or spec.deployment.coordinator_url or spec.chat_url()
@@ -572,7 +632,7 @@ class SwitchyardRouter:
                 "(local_generate is non-stream only)"
             )
         return self._client(spec).chat_stream(
-            messages, temperature=temperature, max_tokens=max_tokens
+            messages, temperature=temperature, max_tokens=max_tokens, extra=extra
         )
 
     def chat_completions_stream(
@@ -620,18 +680,25 @@ class SwitchyardRouter:
             spec = self.resolve_spec(requested_model)
             if spec is None:
                 raise RuntimeError(f"Unknown model: {requested_model}")
-            temp = spec.temperature if temperature is None else float(temperature)
-            mt = spec.max_tokens if max_tokens is None else int(max_tokens)
-            mt = max(1, min(mt, spec.context_window - 512))
-            upstream = self._open_spec_stream(spec, messages, temp, mt)
-            return StreamOutcome(
-                upstream=upstream,
-                served=spec,
-                meta={
-                    "route": "direct",
-                    "served_by": spec.name,
-                    "model_id": spec.id,
-                },
+            return self._stream_with_extra(
+                spec, messages, temperature, max_tokens, extra, route="direct"
+            )
+
+        if self._tools_in_extra(extra):
+            spec = (
+                self.cfg.default_model()
+                or self.cfg.weak()
+                or (self.cfg.selectable_models()[0] if self.cfg.selectable_models() else None)
+            )
+            if not spec:
+                raise RuntimeError("No models configured for tools passthrough")
+            return self._stream_with_extra(
+                spec,
+                messages,
+                temperature,
+                max_tokens,
+                extra,
+                route="tools_passthrough",
             )
 
         strategy = self.cfg.strategy
@@ -710,7 +777,7 @@ class SwitchyardRouter:
             temp = float(temperature) if temperature is not None else chosen.temperature
             mt = int(max_tokens) if max_tokens is not None else chosen.max_tokens
             mt = max(1, min(mt, chosen.context_window - 512))
-            upstream = self._open_spec_stream(chosen, messages, temp, mt)
+            upstream = self._open_spec_stream(chosen, messages, temp, mt, extra=extra)
             return StreamOutcome(
                 upstream=upstream,
                 served=chosen,
@@ -725,7 +792,7 @@ class SwitchyardRouter:
             temp = float(temperature) if temperature is not None else spec.temperature
             mt = int(max_tokens) if max_tokens is not None else spec.max_tokens
             mt = max(1, min(mt, spec.context_window - 512))
-            upstream = self._open_spec_stream(spec, messages, temp, mt)
+            upstream = self._open_spec_stream(spec, messages, temp, mt, extra=extra)
             return StreamOutcome(
                 upstream=upstream,
                 served=spec,
@@ -740,18 +807,8 @@ class SwitchyardRouter:
         spec = self.cfg.default_model()
         if not spec:
             raise RuntimeError("No models configured")
-        temp = spec.temperature if temperature is None else float(temperature)
-        mt = spec.max_tokens if max_tokens is None else int(max_tokens)
-        mt = max(1, min(mt, spec.context_window - 512))
-        upstream = self._open_spec_stream(spec, messages, temp, mt)
-        return StreamOutcome(
-            upstream=upstream,
-            served=spec,
-            meta={
-                "route": "passthrough",
-                "served_by": spec.name,
-                "model_id": spec.id,
-            },
+        return self._stream_with_extra(
+            spec, messages, temperature, max_tokens, extra, route="passthrough"
         )
 
 
