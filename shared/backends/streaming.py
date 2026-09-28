@@ -237,11 +237,15 @@ def completion_to_sse_chunks(
     text = ""
     finish_reason = "stop"
     tool_calls: List[Dict[str, Any]] = []
+    reasoning_content: Optional[str] = None
     try:
         choice0 = result["choices"][0]
         finish_reason = choice0.get("finish_reason") or "stop"
         msg = choice0.get("message") or {}
         text = msg.get("content") or choice0.get("text") or ""
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            reasoning_content = reasoning
         tcs = msg.get("tool_calls")
         if isinstance(tcs, list):
             tool_calls = tcs
@@ -258,6 +262,22 @@ def completion_to_sse_chunks(
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
     }
     yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+
+    if reasoning_content:
+        chunk = {
+            "id": resp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_out,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"reasoning_content": reasoning_content},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
     if not isinstance(text, str):
         text = str(text or "")
@@ -328,6 +348,8 @@ def completion_to_sse_chunks(
         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
     }
     if isinstance(result.get("usage"), dict):
+        # Always attach usage on the terminal chunk. Clients that asked for
+        # stream_options.include_usage expect it; others ignore the field.
         end_chunk["usage"] = result["usage"]
     yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"

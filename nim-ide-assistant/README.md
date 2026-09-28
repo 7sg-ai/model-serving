@@ -108,10 +108,12 @@ This server **forwards** OpenAI-style `tools` / `tool_choice` to the upstream NI
 returns `tool_calls` in JSON and SSE. The **IDE executes** tools (read_file, apply_diff, terminal, …);
 this process does not run workspace tools itself.
 
-When `tools` are present:
-- Response cache and aggressive conversation-memory merge are skipped so the client tool loop stays intact
-- Switchyard multi-step escalation is bypassed for that turn (single-model passthrough)
-- A short system nudge (`IDE_TOOL_NUDGE=true`) encourages the model to call tools instead of asking for pasted code
+When `tools` are present (or the transcript already has tool calls / image parts):
+- The client transcript is forwarded as-is. No system prompt is injected and conversation memory is not merged
+- Response cache is skipped so the client tool loop stays intact
+- Unknown request fields (`stream_options`, `reasoning_content`, `max_completion_tokens`, vendor extensions) are forwarded upstream
+- Switchyard still chooses the model on a fresh user turn. A mid tool-loop turn stays on the current model; if the weak model already returned `tool_calls`, that reply is served and the strong model starts on the next user turn
+- `IDE_TOOL_NUDGE` defaults to off. Set `IDE_TOOL_NUDGE=true` only if you want an extra system nudge
 
 Model quality still matters: small non-tool-tuned instruct models may ignore tools even when schemas are forwarded.
 

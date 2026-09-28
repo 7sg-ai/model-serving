@@ -154,6 +154,7 @@ class EscalationRouter:
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], str]:
         # Prefer local generator when this model is marked local and hook provided
         if self._local_generate and spec.deployment.load_weights_locally:
@@ -204,6 +205,7 @@ class EscalationRouter:
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            extra=extra,
         )
         return result, client.extract_assistant_text(result)
 
@@ -307,6 +309,8 @@ class EscalationRouter:
         session_id: str = "default",
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        freeze_model: bool = False,
     ) -> EscalationResult:
         state = self.get_state(session_id)
         state.turns += 1
@@ -318,7 +322,7 @@ class EscalationRouter:
             # Cap to model context
             mt = max(1, min(int(mt), self.strong.context_window - 512))
             resp, text = self._call_model(
-                self.strong, self._strong_client, messages, temp, mt
+                self.strong, self._strong_client, messages, temp, mt, extra=extra
             )
             resp = dict(resp)
             resp["switchyard"] = {
@@ -344,8 +348,31 @@ class EscalationRouter:
         w_mt = self.weak.max_tokens if max_tokens is None else max_tokens
         w_mt = max(1, min(int(w_mt), self.weak.context_window - 512))
         weak_resp, weak_text = self._call_model(
-            self.weak, self._weak_client, messages, w_temp, w_mt
+            self.weak, self._weak_client, messages, w_temp, w_mt, extra=extra
         )
+
+        # Mid tool-loop: never switch models after the client has started
+        # executing tool_calls. A fresh user turn (freeze_model=False) may still
+        # escalate, but only on the next request — not by discarding this reply.
+        if freeze_model:
+            weak_resp = dict(weak_resp)
+            weak_resp["switchyard"] = {
+                "served_by": "weak",
+                "latched": False,
+                "escalated": False,
+                "route": "escalation",
+                "frozen": True,
+            }
+            return EscalationResult(
+                response=weak_resp,
+                assistant_text=weak_text,
+                served_by="weak",
+                model=self.weak,
+                escalated=False,
+                latched=False,
+                streak=state.streak,
+                state=state,
+            )
 
         # 2) Judge
         verdict, reason = self._judge(messages, weak_text)
@@ -361,11 +388,42 @@ class EscalationRouter:
         if state.streak >= max(1, self.settings.confirmations):
             state.latched = True
             state.latched_at = time.time()
+            # A weak reply that already issued tool_calls must be returned.
+            # Replacing it with a strong answer would drop the client's tool
+            # turn. Latch strong and let the next fresh user turn use it.
+            try:
+                from shared.backends.openai_tools import response_has_tool_calls
+            except Exception:  # pragma: no cover - package layout
+                response_has_tool_calls = lambda _r: False  # type: ignore
+            if response_has_tool_calls(weak_resp):
+                weak_resp = dict(weak_resp)
+                weak_resp["switchyard"] = {
+                    "served_by": "weak",
+                    "latched": True,
+                    "escalated": True,
+                    "judge_verdict": verdict,
+                    "judge_reason": reason,
+                    "streak": state.streak,
+                    "route": "escalation",
+                    "deferred_strong": True,
+                }
+                return EscalationResult(
+                    response=weak_resp,
+                    assistant_text=weak_text,
+                    served_by="weak",
+                    model=self.weak,
+                    escalated=True,
+                    latched=True,
+                    judge_verdict=verdict,
+                    judge_reason=reason,
+                    streak=state.streak,
+                    state=state,
+                )
             s_temp = self.strong.temperature if temperature is None else temperature
             s_mt = self.strong.max_tokens if max_tokens is None else max_tokens
             s_mt = max(1, min(int(s_mt), self.strong.context_window - 512))
             strong_resp, strong_text = self._call_model(
-                self.strong, self._strong_client, messages, s_temp, s_mt
+                self.strong, self._strong_client, messages, s_temp, s_mt, extra=extra
             )
             strong_resp = dict(strong_resp)
             strong_resp["switchyard"] = {
@@ -422,6 +480,7 @@ class EscalationRouter:
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ):
         """Open a live SSE response from the strong tier (caller proxies it)."""
         s_temp = self.strong.temperature if temperature is None else temperature
@@ -433,7 +492,7 @@ class EscalationRouter:
                 "(_local_generate cannot produce SSE)"
             )
         return self._strong_client.chat_stream(
-            messages, temperature=s_temp, max_tokens=s_mt
+            messages, temperature=s_temp, max_tokens=s_mt, extra=extra
         )
 
     def route_unlatched_commit(
@@ -443,12 +502,17 @@ class EscalationRouter:
         session_id: str = "default",
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        freeze_model: bool = False,
     ) -> EscalationResult:
         """
         Run weak+judge for an unlatched session and commit state.
 
         On confirmed escalate, does not call strong — caller should open a
-        live strong stream via open_strong_stream (discard weak this turn).
+        live strong stream via open_strong_stream (discard weak this turn),
+        unless the weak reply already contains tool_calls or the turn is a
+        tool continuation. Those are returned as-is and strong starts next
+        fresh user turn.
         """
         state = self.get_state(session_id)
         state.turns += 1
@@ -459,14 +523,36 @@ class EscalationRouter:
                 session_id=session_id,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                extra=extra,
+                freeze_model=freeze_model,
             )
 
         w_temp = self.weak.temperature if temperature is None else temperature
         w_mt = self.weak.max_tokens if max_tokens is None else max_tokens
         w_mt = max(1, min(int(w_mt), self.weak.context_window - 512))
         weak_resp, weak_text = self._call_model(
-            self.weak, self._weak_client, messages, w_temp, w_mt
+            self.weak, self._weak_client, messages, w_temp, w_mt, extra=extra
         )
+
+        if freeze_model:
+            weak_resp = dict(weak_resp)
+            weak_resp["switchyard"] = {
+                "served_by": "weak",
+                "latched": False,
+                "escalated": False,
+                "route": "escalation",
+                "frozen": True,
+            }
+            return EscalationResult(
+                response=weak_resp,
+                assistant_text=weak_text,
+                served_by="weak",
+                model=self.weak,
+                escalated=False,
+                latched=False,
+                streak=state.streak,
+                state=state,
+            )
 
         verdict, reason = self._judge(messages, weak_text)
         state.last_verdict = verdict
@@ -480,6 +566,34 @@ class EscalationRouter:
         if state.streak >= max(1, self.settings.confirmations):
             state.latched = True
             state.latched_at = time.time()
+            try:
+                from shared.backends.openai_tools import response_has_tool_calls
+            except Exception:  # pragma: no cover
+                response_has_tool_calls = lambda _r: False  # type: ignore
+            if response_has_tool_calls(weak_resp):
+                weak_resp = dict(weak_resp)
+                weak_resp["switchyard"] = {
+                    "served_by": "weak",
+                    "latched": True,
+                    "escalated": True,
+                    "judge_verdict": verdict,
+                    "judge_reason": reason,
+                    "streak": state.streak,
+                    "route": "escalation",
+                    "deferred_strong": True,
+                }
+                return EscalationResult(
+                    response=weak_resp,
+                    assistant_text=weak_text,
+                    served_by="weak",
+                    model=self.weak,
+                    escalated=True,
+                    latched=True,
+                    judge_verdict=verdict,
+                    judge_reason=reason,
+                    streak=state.streak,
+                    state=state,
+                )
             placeholder: Dict[str, Any] = {
                 "switchyard": {
                     "served_by": "strong",

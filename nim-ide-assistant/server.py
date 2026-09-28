@@ -23,16 +23,20 @@ from shared.auth import AuthManager
 from shared.database import ChatHistory
 from shared.cache import ResponseCache, ConversationMemory
 from shared.backends import (
+    annotate_model_entry,
     apply_ide_tool_nudge,
-    build_tools_extra,
+    build_passthrough_extra,
+    openai_error_from_upstream,
     warn_if_not_tool_capable,
     flask_sse_from_completion,
     flask_sse_from_upstream,
     message_content_for_memory,
     post_chat_stream,
-    request_has_tools,
+    resolve_max_tokens,
     should_bypass_memory_merge,
+    should_preserve_client_transcript,
     should_skip_response_cache,
+    stable_session_id,
 )
 from shared.multinode import (
     BackendPool,
@@ -295,20 +299,23 @@ def list_models():
         # Ensure created timestamps
         for item in payload.get("data", []):
             item.setdefault("created", int(datetime.now().timestamp()))
+            annotate_model_entry(item, route=item.get("root") == "switchyard-route")
         return jsonify(payload)
 
     return jsonify(
         {
             "object": "list",
             "data": [
-                {
-                    "id": MODEL_NAME,
-                    "object": "model",
-                    "created": int(datetime.now().timestamp()),
-                    "owned_by": "nim",
-                    "context_window": CONTEXT_WINDOW,
-                    "max_tokens": DEFAULT_MAX_TOKENS,
-                }
+                annotate_model_entry(
+                    {
+                        "id": MODEL_NAME,
+                        "object": "model",
+                        "created": int(datetime.now().timestamp()),
+                        "owned_by": "nim",
+                        "context_window": CONTEXT_WINDOW,
+                        "max_tokens": DEFAULT_MAX_TOKENS,
+                    }
+                )
             ],
         }
     )
@@ -322,22 +329,16 @@ def chat_completions():
 
     data = request.json or {}
     messages = data.get("messages", [])
-    temperature = data.get("temperature", DEFAULT_TEMPERATURE)
-    max_tokens = int(data.get("max_tokens", DEFAULT_MAX_TOKENS))
-    stream = data.get("stream", False)
     requested_model = data.get("model") or MODEL_NAME
-    conversation_id = (
-        request.headers.get("X-Conversation-ID")
-        or data.get("user")
-        or data.get("conversation_id")
-    )
     tools = data.get("tools")
-    tool_choice = data.get("tool_choice")
-    parallel_tool_calls = data.get("parallel_tool_calls")
-    tools_extra = build_tools_extra(tools, tool_choice, parallel_tool_calls)
-
-    # Cap max_tokens so prompt + completion fit the context window
-    max_tokens = max(1, min(max_tokens, CONTEXT_WINDOW - 512))
+    passthrough_extra = build_passthrough_extra(data)
+    preserve = should_preserve_client_transcript(tools, messages)
+    conversation_id = stable_session_id(
+        header_id=request.headers.get("X-Conversation-ID"),
+        conversation_id=data.get("conversation_id") or data.get("session_id"),
+        messages=messages,
+        user=data.get("user"),
+    )
 
     # Per-model context when Switchyard selects a specific tier
     ctx_window = CONTEXT_WINDOW
@@ -347,13 +348,13 @@ def chat_completions():
             spec = SY_CFG.weak()
         if spec:
             ctx_window = spec.context_window or CONTEXT_WINDOW
-            max_tokens = max(1, min(max_tokens, ctx_window - 512))
+    max_tokens = resolve_max_tokens(data, DEFAULT_MAX_TOKENS, cap=ctx_window - 512)
+    temperature = data.get("temperature", DEFAULT_TEMPERATURE)
+    stream = data.get("stream", False)
 
-    # Tool loops: keep client transcript intact (Cline owns tool_calls / tool results)
-    if should_bypass_memory_merge(tools, messages):
+    # Tool / vision turns: the client owns the transcript.
+    if preserve:
         messages = apply_ide_tool_nudge(list(messages or []), tools)
-        if not messages or messages[0].get("role") != "system":
-            messages = ensure_system_message(messages)
     else:
         messages = merge_with_memory(
             conversation_id, messages, max_tokens, context_window=ctx_window
@@ -389,7 +390,7 @@ def chat_completions():
                     temperature=float(temperature),
                     max_tokens=int(max_tokens),
                     session_id=conversation_id or "default",
-                    extra=tools_extra or None,
+                    extra=passthrough_extra or None,
                 )
                 if outcome.is_live_stream:
                     return flask_sse_from_upstream(
@@ -424,7 +425,7 @@ def chat_completions():
                 max_tokens,
                 True,
                 MODEL_NAME,
-                extra=tools_extra or None,
+                extra=passthrough_extra or None,
             )
             return flask_sse_from_upstream(upstream, on_complete=_on_complete)
 
@@ -436,9 +437,9 @@ def chat_completions():
                 max_tokens=int(max_tokens),
                 session_id=conversation_id or "default",
                 stream=False,
-                extra=tools_extra or None,
+                extra=passthrough_extra or None,
             )
-            if assistant_content and not should_bypass_memory_merge(tools, messages):
+            if assistant_content and not preserve:
                 remember_exchange(conversation_id, messages, assistant_content)
         else:
             result = _legacy_upstream_chat(
@@ -447,11 +448,11 @@ def chat_completions():
                 max_tokens,
                 False,
                 MODEL_NAME,
-                extra=tools_extra or None,
+                extra=passthrough_extra or None,
             )
             try:
                 assistant_content = message_content_for_memory(result)
-                if assistant_content and not request_has_tools(tools):
+                if assistant_content and not preserve:
                     remember_exchange(conversation_id, messages, assistant_content)
             except (KeyError, IndexError, TypeError):
                 pass
@@ -465,18 +466,8 @@ def chat_completions():
         return jsonify(result)
 
     except Exception as e:
-        return (
-            jsonify(
-                {
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": "nim_error",
-                    }
-                }
-            ),
-            500,
-        )
+        body, status = openai_error_from_upstream(e, fallback_code="nim_error")
+        return jsonify(body), status
 
 
 

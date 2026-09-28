@@ -22,6 +22,7 @@ import requests
 from .client import ModelClient
 from .config import ModelSpec, SwitchyardConfig, get_switchyard_config
 from .escalation import EscalationRouter, EscalationResult, build_escalation_router
+from shared.backends.openai_tools import is_tool_continuation
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +68,32 @@ class SwitchyardRouter:
         if cfg.enabled and cfg.strategy == "escalation":
             self.escalation = build_escalation_router(cfg, local_generate=local_generate)
         self._clients: Dict[str, ModelClient] = {}
+        # session_id -> model name, so random/capability tool loops stay put.
+        self._sticky: Dict[str, str] = {}
 
     def _client(self, spec: ModelSpec) -> ModelClient:
         key = spec.name
         if key not in self._clients:
             self._clients[key] = ModelClient(spec)
         return self._clients[key]
+
+    def _remember_spec(self, session_id: str, spec: Optional[ModelSpec]) -> None:
+        if not session_id or spec is None:
+            return
+        self._sticky[session_id] = spec.name
+
+    def _sticky_spec(
+        self,
+        session_id: str,
+        models: List[ModelSpec],
+    ) -> Optional[ModelSpec]:
+        name = self._sticky.get(session_id or "")
+        if not name:
+            return None
+        for spec in models:
+            if spec.name == name or spec.id == name:
+                return spec
+        return None
 
     # ----- listing -----
 
@@ -309,66 +330,30 @@ class SwitchyardRouter:
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        extra: Optional[Dict[str, Any]] = None,
+        *,
+        freeze_model: bool = False,
     ) -> Tuple[Dict[str, Any], str, ModelSpec]:
         weak = self.cfg.weak()
-        strong = self.cfg.strong()
-        judge = self.cfg.judge() or weak
         if not weak:
             raise RuntimeError("No weak/default model configured for capability routing")
-        if not strong:
-            strong = weak
 
-        # Quick classifier: ask judge if task needs strong
-        preview = []
-
-        for m in messages[-6:]:
-            c = m.get("content", "")
-            if not isinstance(c, str):
-                c = str(c)
-            preview.append({"role": m.get("role", "user"), "content": c[:500]})
-        judge_msgs = [
-            {
-                "role": "system",
-                "content": (
-                    "You classify coding tasks. "
-                    'Return ONLY JSON: {"verdict":"strong"|"weak","reason":"..."}. '
-                    "Use strong for complex multi-file refactors, architecture, hard bugs; "
-                    "weak for simple edits, explanations, small snippets."
-                ),
-            },
-            {
-                "role": "user",
-                "content": "Task messages:\n" + str(preview),
-            },
-        ]
-        pick = strong
-        try:
-            jclient = self._client(judge)
-            jres = jclient.chat(judge_msgs, temperature=0.0, max_tokens=256)
-            jtext = jclient.extract_assistant_text(jres).lower()
-            if "weak" in jtext and "strong" not in jtext.split("weak")[0][-20:]:
-                # crude: if verdict weak
-                if '"verdict": "weak"' in jtext or '"verdict":"weak"' in jtext:
-                    pick = weak
-                elif "verdict" in jtext and "strong" in jtext:
-                    pick = strong
-                else:
-                    pick = weak if "weak" in jtext else strong
-            elif "strong" in jtext:
-                pick = strong
-            else:
-                pick = weak
-        except Exception as exc:
-            logger.warning("Capability judge failed, defaulting to weak: %s", exc)
+        if freeze_model:
             pick = weak
+        else:
+            pick, _meta = self._capability_pick(messages)
+            if pick is None:
+                pick = weak
 
         mt = max(1, min(int(max_tokens), pick.context_window - 512))
-        resp, text = self._call_spec(pick, messages, temperature, mt)
+        resp, text = self._call_spec(pick, messages, temperature, mt, extra=extra)
         resp = dict(resp)
         resp["switchyard"] = {
             "route": "capability",
             "served_by": pick.role,
             "model_id": pick.id,
+            "frozen": bool(freeze_model),
+            "tools_passthrough": bool(self._tools_in_extra(extra)),
         }
         return resp, text, pick
 
@@ -377,18 +362,26 @@ class SwitchyardRouter:
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        extra: Optional[Dict[str, Any]] = None,
+        *,
+        freeze_model: bool = False,
+        session_id: str = "default",
     ) -> Tuple[Dict[str, Any], str, ModelSpec]:
         models = self.cfg.selectable_models()
         if not models:
             raise RuntimeError("No models configured for random routing")
-        pick = random.choice(models)
+        pick = self._sticky_spec(session_id, models) if freeze_model else random.choice(models)
+        if pick is None:
+            pick = models[0]
         mt = max(1, min(int(max_tokens), pick.context_window - 512))
-        resp, text = self._call_spec(pick, messages, temperature, mt)
+        resp, text = self._call_spec(pick, messages, temperature, mt, extra=extra)
         resp = dict(resp)
         resp["switchyard"] = {
             "route": "random",
             "served_by": pick.name,
             "model_id": pick.id,
+            "frozen": bool(freeze_model),
+            "tools_passthrough": bool(self._tools_in_extra(extra)),
         }
         return resp, text, pick
 
@@ -488,7 +481,7 @@ class SwitchyardRouter:
                 pass
             return data, text, None
 
-        # Direct model selection
+        # Direct model selection — concrete ids always win over the virtual route.
         if not self.is_route_request(requested_model):
             spec = self.resolve_spec(requested_model)
             if spec is None:
@@ -497,26 +490,10 @@ class SwitchyardRouter:
                 spec, messages, temperature, max_tokens, extra, route="direct"
             )
 
-        # IDE tool loops: skip multi-step escalation/capability judge so tools
-        # round-trip on a single known upstream model.
-        if self._tools_in_extra(extra):
-            spec = (
-                self.cfg.default_model()
-                or self.cfg.weak()
-                or (self.cfg.selectable_models()[0] if self.cfg.selectable_models() else None)
-            )
-            if not spec:
-                raise RuntimeError("No models configured for tools passthrough")
-            return self._direct_with_extra(
-                spec,
-                messages,
-                temperature,
-                max_tokens,
-                extra,
-                route="tools_passthrough",
-            )
-
-        # Strategy routes
+        # Strategy routes. Tools are forwarded via extra; they do not bypass
+        # model control. A mid tool-loop turn freezes the current tier so the
+        # client does not see a model change between tool_calls and results.
+        freeze = is_tool_continuation(messages)
         strategy = self.cfg.strategy
         if strategy == "escalation":
             if not self.escalation:
@@ -529,6 +506,8 @@ class SwitchyardRouter:
                 session_id=session_id or "default",
                 temperature=temp,
                 max_tokens=mt,
+                extra=extra,
+                freeze_model=freeze,
             )
             return result.response, result.assistant_text, result.model
 
@@ -539,12 +518,29 @@ class SwitchyardRouter:
             mt = int(max_tokens) if max_tokens is not None else (
                 self.cfg.weak().max_tokens if self.cfg.weak() else 32768
             )
-            return self._capability_route(messages, temp, mt)
+            resp, text, spec = self._capability_route(
+                messages,
+                temp,
+                mt,
+                extra,
+                freeze_model=freeze,
+            )
+            self._remember_spec(session_id or "default", spec)
+            return resp, text, spec
 
         if strategy == "random":
             temp = float(temperature) if temperature is not None else 0.3
             mt = int(max_tokens) if max_tokens is not None else 32768
-            return self._random_route(messages, temp, mt)
+            resp, text, spec = self._random_route(
+                messages,
+                temp,
+                mt,
+                extra,
+                freeze_model=freeze,
+                session_id=session_id or "default",
+            )
+            self._remember_spec(session_id or "default", spec)
+            return resp, text, spec
 
         # passthrough
         spec = self.cfg.default_model()
@@ -684,23 +680,7 @@ class SwitchyardRouter:
                 spec, messages, temperature, max_tokens, extra, route="direct"
             )
 
-        if self._tools_in_extra(extra):
-            spec = (
-                self.cfg.default_model()
-                or self.cfg.weak()
-                or (self.cfg.selectable_models()[0] if self.cfg.selectable_models() else None)
-            )
-            if not spec:
-                raise RuntimeError("No models configured for tools passthrough")
-            return self._stream_with_extra(
-                spec,
-                messages,
-                temperature,
-                max_tokens,
-                extra,
-                route="tools_passthrough",
-            )
-
+        freeze = is_tool_continuation(messages)
         strategy = self.cfg.strategy
 
         if strategy == "escalation":
@@ -720,7 +700,7 @@ class SwitchyardRouter:
                 state = esc.get_state(sid)
                 state.turns += 1
                 upstream = esc.open_strong_stream(
-                    messages, temperature=s_temp, max_tokens=s_mt
+                    messages, temperature=s_temp, max_tokens=s_mt, extra=extra
                 )
                 return StreamOutcome(
                     upstream=upstream,
@@ -739,6 +719,8 @@ class SwitchyardRouter:
                 session_id=sid,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                extra=extra,
+                freeze_model=freeze,
             )
             if result.escalated and result.served_by == "strong":
                 s_temp = (
@@ -753,7 +735,7 @@ class SwitchyardRouter:
                 )
                 s_mt = max(1, min(s_mt, esc.strong.context_window - 512))
                 upstream = esc.open_strong_stream(
-                    messages, temperature=s_temp, max_tokens=s_mt
+                    messages, temperature=s_temp, max_tokens=s_mt, extra=extra
                 )
                 meta = dict(result.response.get("switchyard") or {})
                 meta.setdefault("model_id", esc.strong.id)
@@ -773,7 +755,19 @@ class SwitchyardRouter:
             )
 
         if strategy == "capability":
-            chosen, meta = self._capability_pick(messages)
+            if freeze:
+                chosen = self._sticky_spec(sid, self.cfg.selectable_models()) or self.cfg.weak()
+                if not chosen:
+                    raise RuntimeError("No weak/default model configured for capability routing")
+                meta = {
+                    "route": "capability",
+                    "served_by": chosen.role,
+                    "model_id": chosen.id,
+                    "frozen": True,
+                }
+            else:
+                chosen, meta = self._capability_pick(messages)
+                self._remember_spec(sid, chosen)
             temp = float(temperature) if temperature is not None else chosen.temperature
             mt = int(max_tokens) if max_tokens is not None else chosen.max_tokens
             mt = max(1, min(mt, chosen.context_window - 512))
@@ -788,7 +782,10 @@ class SwitchyardRouter:
             models = self.cfg.selectable_models()
             if not models:
                 raise RuntimeError("No models configured for random routing")
-            spec = random.choice(models)
+            spec = self._sticky_spec(sid, models) if freeze else random.choice(models)
+            if spec is None:
+                spec = models[0]
+            self._remember_spec(sid, spec)
             temp = float(temperature) if temperature is not None else spec.temperature
             mt = int(max_tokens) if max_tokens is not None else spec.max_tokens
             mt = max(1, min(mt, spec.context_window - 512))

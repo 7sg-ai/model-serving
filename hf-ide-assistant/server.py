@@ -25,8 +25,10 @@ from shared.cache import (
 )
 from shared.backends import (
     OpenAIChatClient,
+    annotate_model_entry,
     apply_ide_tool_nudge,
-    build_tools_extra,
+    build_passthrough_extra,
+    openai_error_from_upstream,
     warn_if_not_tool_capable,
     flask_sse_from_completion,
     flask_sse_from_upstream,
@@ -34,9 +36,11 @@ from shared.backends import (
     normalize_chat_url,
     post_chat_stream,
     require_backend_urls,
-    request_has_tools,
+    resolve_max_tokens,
     should_bypass_memory_merge,
+    should_preserve_client_transcript,
     should_skip_response_cache,
+    stable_session_id,
 )
 
 from shared.deploy import ensure_models_runtime
@@ -324,21 +328,24 @@ def list_models():
             item.setdefault("created", int(datetime.now().timestamp()))
             if item.get("id") == MODEL_NAME:
                 item["effective_context_window"] = EFFECTIVE_CONTEXT_WINDOW
+            annotate_model_entry(item, route=item.get("root") == "switchyard-route")
         return jsonify(payload)
 
     return jsonify(
         {
             "object": "list",
             "data": [
-                {
-                    "id": MODEL_NAME,
-                    "object": "model",
-                    "created": int(datetime.now().timestamp()),
-                    "owned_by": "vllm",
-                    "context_window": CONTEXT_WINDOW,
-                    "effective_context_window": EFFECTIVE_CONTEXT_WINDOW,
-                    "max_tokens": DEFAULT_MAX_TOKENS,
-                }
+                annotate_model_entry(
+                    {
+                        "id": MODEL_NAME,
+                        "object": "model",
+                        "created": int(datetime.now().timestamp()),
+                        "owned_by": "vllm",
+                        "context_window": CONTEXT_WINDOW,
+                        "effective_context_window": EFFECTIVE_CONTEXT_WINDOW,
+                        "max_tokens": DEFAULT_MAX_TOKENS,
+                    }
+                )
             ],
         }
     )
@@ -351,21 +358,16 @@ def chat_completions():
 
     data = request.json or {}
     messages = data.get("messages", [])
-    temperature = float(data.get("temperature", DEFAULT_TEMPERATURE))
-    max_tokens = int(data.get("max_tokens", DEFAULT_MAX_TOKENS))
-    max_tokens = max(1, min(max_tokens, EFFECTIVE_CONTEXT_WINDOW - 64))
-    stream = bool(data.get("stream", False))
     requested_model = data.get("model") or MODEL_NAME
     tools = data.get("tools")
-    tool_choice = data.get("tool_choice")
-    parallel_tool_calls = data.get("parallel_tool_calls")
-    tools_extra = build_tools_extra(tools, tool_choice, parallel_tool_calls)
+    passthrough_extra = build_passthrough_extra(data)
+    preserve = should_preserve_client_transcript(tools, messages)
 
-    conversation_id = (
-        request.headers.get("X-Conversation-ID")
-        or data.get("user")
-        or data.get("conversation_id")
-        or "default"
+    conversation_id = stable_session_id(
+        header_id=request.headers.get("X-Conversation-ID"),
+        conversation_id=data.get("conversation_id") or data.get("session_id"),
+        messages=messages,
+        user=data.get("user"),
     )
 
     if not messages:
@@ -379,12 +381,13 @@ def chat_completions():
                 EFFECTIVE_CONTEXT_WINDOW,
                 spec.context_window or EFFECTIVE_CONTEXT_WINDOW,
             )
-            max_tokens = max(1, min(max_tokens, ctx_window - 64))
+    max_tokens = resolve_max_tokens(data, DEFAULT_MAX_TOKENS, cap=ctx_window - 64)
+    temperature = float(data.get("temperature", DEFAULT_TEMPERATURE))
+    stream = bool(data.get("stream", False))
 
-    if should_bypass_memory_merge(tools, messages):
+    # Tool / vision turns: the client owns the transcript.
+    if preserve:
         messages = apply_ide_tool_nudge(list(messages or []), tools)
-        if not messages or messages[0].get("role") != "system":
-            messages = ensure_system_message(messages)
     else:
         messages = merge_with_memory(
             conversation_id, messages, max_tokens, context_window=ctx_window
@@ -416,7 +419,7 @@ def chat_completions():
                     temperature=temperature,
                     max_tokens=max_tokens,
                     session_id=conversation_id,
-                    extra=tools_extra or None,
+                    extra=passthrough_extra or None,
                 )
                 if outcome.is_live_stream:
                     return flask_sse_from_upstream(
@@ -460,7 +463,7 @@ def chat_completions():
                     max_tokens=max_tokens,
                     api_key=VLLM_API_KEY,
                     timeout=float(REQUEST_TIMEOUT),
-                    extra=tools_extra or None,
+                    extra=passthrough_extra or None,
                 )
                 CLUSTER.backend_pool.mark_success(backend)
             except Exception:
@@ -475,9 +478,9 @@ def chat_completions():
                 temperature=temperature,
                 max_tokens=max_tokens,
                 session_id=conversation_id,
-                extra=tools_extra or None,
+                extra=passthrough_extra or None,
             )
-            if response_text and not should_bypass_memory_merge(tools, messages):
+            if response_text and not preserve:
                 remember_exchange(conversation_id, messages, response_text)
             if isinstance(result, dict):
                 result = dict(result)
@@ -491,37 +494,27 @@ def chat_completions():
             max_tokens,
             temperature,
             model_id=requested_model,
-            extra=tools_extra or None,
+            extra=passthrough_extra or None,
         )
     except Exception as e:
-        return (
-            jsonify(
-                {
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": "vllm_error",
-                    }
-                }
-            ),
-            500,
-        )
+        body, status = openai_error_from_upstream(e, fallback_code="vllm_error")
+        return jsonify(body), status
 
     # Prefer upstream body when tool_calls present so IDE clients see them
     if isinstance(raw, dict) and (
         (raw.get("choices") or [{}])[0].get("message", {}).get("tool_calls")
-        or tools_extra
+        or passthrough_extra
     ):
         result = dict(raw)
         result["cached"] = False
-        if cache_key is not None and not request_has_tools(tools):
+        if cache_key is not None and not preserve:
             response_cache.set(cache_key, result)
         content = message_content_for_memory(result)
-        if content and not should_bypass_memory_merge(tools, messages):
+        if content and not preserve:
             remember_exchange(conversation_id, messages, content)
         return jsonify(result)
 
-    if response_text and not should_bypass_memory_merge(tools, messages):
+    if response_text and not preserve:
         remember_exchange(conversation_id, messages, response_text)
 
     result = {
