@@ -113,7 +113,7 @@ def schedule_replicas(
         port_cursor[t] = port + 1
         svc_i = local_svc_idx[t]
         local_svc_idx[t] = svc_i + 1
-        prefix = "vllm" if cfg.engine == "vllm" else "nim"
+        prefix = cfg.engine if cfg.engine in ("vllm", "sglang", "nim") else "model"
         place = ReplicaPlacement(
             replica_index=r,
             target=t,

@@ -1,4 +1,4 @@
-"""Ensure NIM/vLLM containers are running; tear down on exit when owned."""
+"""Ensure NIM/vLLM/SGLang containers are running; tear down on exit when owned."""
 from __future__ import annotations
 
 import atexit
@@ -19,9 +19,33 @@ from .health import any_healthy, wait_until_healthy
 from .inventory import inventory_nodes, parse_deploy_nodes
 from .remote_exec import deploy_node_plan, teardown_node_plan
 from .scheduler import NodePlan, schedule_replicas
+from .engines import is_model_free_nim_image, nim_model_path, normalize_engine
 from .ssh_util import is_local_target
 
 logger = logging.getLogger(__name__)
+
+
+def _nim_needs_ngc(cfg: DeployConfig) -> bool:
+    """Catalog NIM and nvcr.io pulls need NGC. A pre-pulled local image does not."""
+    image = (cfg.image or "").lower()
+    if image.startswith("nvcr.io/") or "nvidia.com" in image:
+        return True
+    return not cfg.model_free_nim()
+
+
+def _spec_engine(spec: Any, fallback: str) -> str:
+    dep = getattr(spec, "deployment", None)
+    extra = getattr(dep, "extra", None) or {}
+    raw = ""
+    if isinstance(extra, dict):
+        raw = str(extra.get("engine") or extra.get("x_engine") or "")
+    if not raw and dep is not None:
+        raw = str(getattr(dep, "engine", "") or "")
+    if not raw:
+        raw = str(getattr(spec, "engine", "") or "")
+    if not raw:
+        return normalize_engine(fallback)
+    return normalize_engine(raw)
 
 _lock = threading.Lock()
 _registered_handles: List["RuntimeHandle"] = []
@@ -208,8 +232,10 @@ def _deploy_local(cfg: DeployConfig, api_key: str) -> RuntimeHandle:
         raise RuntimeError(
             "AUTO_DEPLOY_MODEL requires Docker on the control node for local deploy."
         )
-    if cfg.engine == "nim" and not cfg.ngc_api_key:
-        raise RuntimeError("NGC_API_KEY is required to auto-deploy NIM containers.")
+    if cfg.engine == "nim" and not cfg.ngc_api_key and _nim_needs_ngc(cfg):
+        raise RuntimeError(
+            "NGC_API_KEY is required to pull NIM images from nvcr.io."
+        )
 
     compose_file, urls = generate_compose(cfg)
     project = cfg.resolved_project()
@@ -251,8 +277,10 @@ def _deploy_local(cfg: DeployConfig, api_key: str) -> RuntimeHandle:
 
 
 def _deploy_multi_node(cfg: DeployConfig, api_key: str) -> RuntimeHandle:
-    if cfg.engine == "nim" and not cfg.ngc_api_key:
-        raise RuntimeError("NGC_API_KEY is required to auto-deploy NIM containers.")
+    if cfg.engine == "nim" and not cfg.ngc_api_key and _nim_needs_ngc(cfg):
+        raise RuntimeError(
+            "NGC_API_KEY is required to pull NIM images from nvcr.io."
+        )
 
     targets = cfg.deploy_nodes or parse_deploy_nodes()
     logger.info("Multi-node deploy targets: %s", targets)
@@ -336,6 +364,13 @@ def ensure_model_runtime(
     existing_urls: Optional[Sequence[str]] = None,
     register_teardown: bool = True,
     api_key: str = "",
+    nim_model_path_value: Optional[str] = None,
+    nim_served_model_name: Optional[str] = None,
+    nim_model_profile: Optional[str] = None,
+    trust_remote_code: Optional[bool] = None,
+    tool_call_parser: Optional[str] = None,
+    reasoning_parser: Optional[str] = None,
+    extra_args: Optional[List[str]] = None,
 ) -> RuntimeHandle:
     """
     Ensure model containers exist when AUTO_DEPLOY_MODEL is on.
@@ -357,6 +392,13 @@ def ensure_model_runtime(
         port_base=port_base,
         image=image,
         project=project,
+        nim_model_path=nim_model_path_value,
+        nim_served_model_name=nim_served_model_name,
+        nim_model_profile=nim_model_profile,
+        trust_remote_code=trust_remote_code,
+        tool_call_parser=tool_call_parser,
+        reasoning_parser=reasoning_parser,
+        extra_args=extra_args,
     )
     existing = _normalize_existing(existing_urls)
 
@@ -382,7 +424,7 @@ def ensure_model_runtime(
                 teardown_on_exit=False,
             )
         raise RuntimeError(
-            "AUTO_DEPLOY_MODEL=false and no healthy BACKEND_URLS/NIM_API_URL/VLLM_API_URL. "
+            "AUTO_DEPLOY_MODEL=false and no healthy BACKEND_URLS/NIM_API_URL/VLLM_API_URL/SGLANG_API_URL. "
             "Start model servers or enable AUTO_DEPLOY_MODEL."
         )
 
@@ -422,12 +464,15 @@ def _model_spec_deploy_key(spec: Any) -> str:
     cvd = (getattr(dep, "cuda_visible_devices", "") or "").strip()
     image = (getattr(dep, "nim_image", "") or "").strip()
     extra = getattr(dep, "extra", None) or {}
-    if not image and isinstance(extra, dict):
-        image = str(extra.get("image", "") or "").strip()
+    if isinstance(extra, dict):
+        image = image or str(extra.get("image") or extra.get("sglang_image") or "").strip()
+    path = ""
+    if isinstance(extra, dict):
+        path = str(extra.get("nim_model_path") or extra.get("model_path") or "").strip()
     tp = int(getattr(dep, "tensor_parallel_size", 1) or 1)
     mode = (getattr(dep, "deploy_mode", "replica") or "replica").strip().lower()
     mid = getattr(spec, "id", "") or ""
-    return f"id:{mid}|img:{image}|cvd:{cvd}|tp:{tp}|mode:{mode}"
+    return f"id:{mid}|img:{image}|path:{path}|cvd:{cvd}|tp:{tp}|mode:{mode}"
 
 
 def _split_gpu_csv(raw: str) -> List[str]:
@@ -498,6 +543,8 @@ def ensure_models_runtime(
     if port_base is None:
         if (engine or "").lower() == "nim":
             base = int(os.getenv("NIM_PORT", "8000") or "8000")
+        elif (engine or "").lower() == "sglang":
+            base = int(os.getenv("SGLANG_PORT", os.getenv("VLLM_PORT", "8000")) or "8000")
         else:
             base = int(os.getenv("VLLM_PORT", "8000") or "8000")
     else:
@@ -533,8 +580,28 @@ def ensure_models_runtime(
         mode = (getattr(dep, "deploy_mode", "") or None) or None
         image = (getattr(dep, "nim_image", "") or "").strip()
         extra = getattr(dep, "extra", None) or {}
-        if not image and isinstance(extra, dict):
-            image = str(extra.get("image", "") or "").strip()
+        if not isinstance(extra, dict):
+            extra = {}
+        if not image:
+            image = str(extra.get("image") or extra.get("sglang_image") or "").strip()
+        model_path = str(
+            extra.get("nim_model_path") or extra.get("model_path") or ""
+        ).strip()
+        served_name = str(
+            extra.get("nim_served_model_name") or extra.get("served_model_name") or ""
+        ).strip()
+        profile = str(extra.get("nim_model_profile") or extra.get("model_profile") or "").strip()
+        stack_engine = _spec_engine(lead, engine)
+        if stack_engine == "nim" and not model_path and is_model_free_nim_image(image):
+            model_path = nim_model_path(getattr(lead, "id", "") or "")
+        trust = extra.get("trust_remote_code")
+        if trust is None:
+            trust = getattr(dep, "trust_remote_code", None)
+        tool_parser = str(extra.get("tool_call_parser") or "").strip()
+        reason_parser = str(extra.get("reasoning_parser") or "").strip()
+        raw_args = extra.get("extra_args") or extra.get("engine_args") or []
+        if isinstance(raw_args, str):
+            raw_args = [p.strip() for p in raw_args.split(",") if p.strip()]
         gpr = int(getattr(dep, "gpu_count", 0) or 0) or max(tp * pp, len(gpus) or 1)
 
         slug_id = re_slug(getattr(lead, "name", None) or getattr(lead, "id", "model"))
@@ -542,7 +609,19 @@ def ensure_models_runtime(
         # Reserve ports for potential multi-replica of this stack
         replicas = 1
         try:
-            replicas = max(1, int(os.getenv("VLLM_REPLICA_COUNT", os.getenv("NIM_REPLICA_COUNT", "1")) or "1"))
+            replicas = max(
+                1,
+                int(
+                    os.getenv(
+                        "VLLM_REPLICA_COUNT",
+                        os.getenv(
+                            "SGLANG_REPLICA_COUNT",
+                            os.getenv("NIM_REPLICA_COUNT", "1"),
+                        ),
+                    )
+                    or "1"
+                ),
+            )
         except ValueError:
             replicas = 1
         if mode == "sharded":
@@ -564,12 +643,21 @@ def ensure_models_runtime(
                 "port": model_port,
                 "project_suffix": slug_id,
                 "model_id": getattr(lead, "id", "") or "",
+                "engine": stack_engine,
+                "nim_model_path": model_path or None,
+                "nim_served_model_name": served_name or None,
+                "nim_model_profile": profile or None,
+                "trust_remote_code": trust,
+                "tool_call_parser": tool_parser or None,
+                "reasoning_parser": reason_parser or None,
+                "extra_args": list(raw_args) if raw_args else None,
             }
         )
 
     def _one(entry: Dict[str, Any]) -> RuntimeHandle:
+        stack_engine = entry.get("engine") or engine
         handle = ensure_model_runtime(
-            engine,
+            stack_engine,
             app_name=f"{app_name}-{entry['project_suffix']}",
             model_id=entry["model_id"],
             deploy_mode=entry["mode"],
@@ -580,10 +668,17 @@ def ensure_models_runtime(
             gpu_per_replica=entry["gpr"],
             port_base=entry["port"],
             image=entry["image"],
-            project=f"ms-{engine}-{app_name}-{entry['project_suffix']}",
+            project=f"ms-{stack_engine}-{app_name}-{entry['project_suffix']}",
             existing_urls=entry["existing"] or None,
             register_teardown=register_teardown,
             api_key=api_key,
+            nim_model_path_value=entry.get("nim_model_path"),
+            nim_served_model_name=entry.get("nim_served_model_name"),
+            nim_model_profile=entry.get("nim_model_profile"),
+            trust_remote_code=entry.get("trust_remote_code"),
+            tool_call_parser=entry.get("tool_call_parser"),
+            reasoning_parser=entry.get("reasoning_parser"),
+            extra_args=entry.get("extra_args"),
         )
         # Write URLs back to all specs in the group
         urls = list(handle.urls or entry["existing"] or [])

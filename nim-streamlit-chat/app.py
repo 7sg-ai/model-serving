@@ -13,6 +13,7 @@ from shared.database import ChatHistory
 from shared.multinode import BackendPool, ClusterInfo, get_multinode_config
 from shared.tools import get_web_access_tool, get_web_enricher
 from shared.model_catalog import deploy_app_models, load_app_models
+from shared.deploy.app_engine import resolve_app_engine
 
 MN_CFG = get_multinode_config(default_port=8501, app_name="nim-streamlit-chat")
 CLUSTER = ClusterInfo(MN_CFG, app_name="nim-streamlit-chat")
@@ -32,7 +33,7 @@ SY_CFG = load_app_models(
     reload=True,
 )
 CATALOG, _HANDLES = deploy_app_models(
-    "nim",
+    resolve_app_engine("nim"),
     SY_CFG,
     app_name="nim-streamlit-chat",
     default_backend_urls=MN_CFG.backend_urls or ([NIM_API_URL] if NIM_API_URL else []),

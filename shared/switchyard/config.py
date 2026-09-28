@@ -185,6 +185,13 @@ class ModelSpec:
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "deployment": self.deployment.to_dict(),
+            "capabilities": {
+                "tools": True,
+                "reasoning": any(
+                    h in (self.id or "").lower()
+                    for h in ("deepseek-r1", "qwen3", "qwq", "reasoning", "think", "kimi", "gpt-oss")
+                ),
+            },
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -350,7 +357,29 @@ def _deployment_from_dict(raw: Optional[Dict[str, Any]]) -> DeploymentParams:
         nim_port=int(raw.get("nim_port", 0) or 0),
         gpu_count=int(raw.get("gpu_count", 0) or 0),
         node_selector=str(raw.get("node_selector", "") or ""),
-        extra={k: v for k, v in raw.items() if k.startswith("x_") or k == "extra"},
+        extra={
+            k: v
+            for k, v in raw.items()
+            if k.startswith("x_")
+            or k == "extra"
+            or k
+            in (
+                "engine",
+                "image",
+                "sglang_image",
+                "nim_model_path",
+                "model_path",
+                "nim_served_model_name",
+                "served_model_name",
+                "nim_model_profile",
+                "model_profile",
+                "tool_call_parser",
+                "reasoning_parser",
+                "extra_args",
+                "engine_args",
+                "trust_remote_code",
+            )
+        },
     )
 
 
@@ -374,6 +403,16 @@ def model_spec_from_dict(raw: Dict[str, Any], index: int = 0) -> ModelSpec:
         "local",
         "nim_image",
         "gpu_count",
+        "engine",
+        "image",
+        "nim_model_path",
+        "model_path",
+        "nim_served_model_name",
+        "served_model_name",
+        "nim_model_profile",
+        "tool_call_parser",
+        "reasoning_parser",
+        "sglang_image",
     ):
         if key in raw and key not in dep_raw:
             dep_raw[key] = raw[key]

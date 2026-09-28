@@ -19,12 +19,14 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Deploy/teardown NIM or vLLM model runtimes")
+    p = argparse.ArgumentParser(
+        description="Deploy/teardown NIM, vLLM, or SGLang model runtimes"
+    )
     p.add_argument(
         "action",
         choices=["up", "down", "status", "generate", "inventory", "plan"],
     )
-    p.add_argument("--engine", choices=["nim", "vllm"], default="vllm")
+    p.add_argument("--engine", choices=["nim", "vllm", "sglang"], default="vllm")
     p.add_argument("--app-name", default="cli")
     p.add_argument("--model", default="")
     p.add_argument("--nodes", default="", help="Override DEPLOY_NODES csv")

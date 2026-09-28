@@ -90,9 +90,11 @@ def deploy_key(spec: ModelSpec) -> str:
         return "urls:" + ",".join(urls)
     cvd = (dep.cuda_visible_devices or "").strip()
     image = (dep.nim_image or str(dep.extra.get("image", "") or "")).strip()
+    path = str(dep.extra.get("nim_model_path") or dep.extra.get("model_path") or "").strip()
+    stack = str(dep.extra.get("engine") or dep.extra.get("x_engine") or "").strip()
     tp = int(dep.tensor_parallel_size or 1)
     mode = (dep.deploy_mode or "replica").strip().lower()
-    return f"id:{spec.id}|img:{image}|cvd:{cvd}|tp:{tp}|mode:{mode}"
+    return f"id:{spec.id}|eng:{stack}|img:{image}|path:{path}|cvd:{cvd}|tp:{tp}|mode:{mode}"
 
 
 @dataclass

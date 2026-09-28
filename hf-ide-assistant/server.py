@@ -40,6 +40,7 @@ from shared.backends import (
 )
 
 from shared.deploy import ensure_models_runtime
+from shared.deploy.app_engine import resolve_app_engine
 from shared.multinode import (
     BackendPool,
     ClusterInfo,
@@ -153,7 +154,7 @@ if not _deploy_specs:
     ]
 
 _HANDLES = ensure_models_runtime(
-    "vllm",
+    resolve_app_engine("hf"),
     _deploy_specs,
     app_name="hf-ide-assistant",
     api_key=VLLM_API_KEY,
@@ -181,7 +182,7 @@ CLUSTER.backend_pool = BackendPool(
 )
 MN_CFG.backend_urls = list(CLUSTER.backend_pool.urls)
 print(
-    f"Model runtime: engine=vllm stacks={len(_HANDLES)} "
+    f"Model runtime: engine={resolve_app_engine('hf')} stacks={len(_HANDLES)} "
     f"models={[getattr(m, 'id', m) for m in _deploy_specs]} "
     f"backends={CLUSTER.backend_pool.all()}"
 )

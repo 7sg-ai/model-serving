@@ -42,6 +42,7 @@ from shared.multinode import (
     run_flask_app,
 )
 from shared.deploy import ensure_models_runtime
+from shared.deploy.app_engine import resolve_app_engine
 from shared.switchyard import (
     get_switchyard_config,
     get_switchyard_router,
@@ -121,7 +122,7 @@ if not _deploy_specs:
         ModelSpec(name="default", id=MODEL_NAME, role="weak", deployment=_dep)
     ]
 _HANDLES = ensure_models_runtime(
-    "nim",
+    resolve_app_engine("nim"),
     _deploy_specs,
     app_name="nim-ide-assistant",
     default_backend_urls=MN_CFG.backend_urls or ([NIM_API_URL] if NIM_API_URL else []),
@@ -148,7 +149,7 @@ if _all_urls:
 if SY_CFG.models:
     SY_CFG.models = list(_deploy_specs)
 print(
-    f"Model runtime: engine=nim stacks={len(_HANDLES)} "
+    f"Model runtime: engine={resolve_app_engine('nim')} stacks={len(_HANDLES)} "
     f"models={[getattr(m, 'id', m) for m in _deploy_specs]} "
     f"backends={CLUSTER.backend_pool.all()}"
 )

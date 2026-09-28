@@ -71,21 +71,46 @@ NIM and HF apps can **start their model servers via Docker Compose** on startup:
 
 - `AUTO_DEPLOY_MODEL=true` (default) — deploy if backends are not already healthy
 - `AUTO_DEPLOY_TEARDOWN_ON_EXIT=true` (default) — stop **owned** containers when the app exits
-- Engine: NIM apps → NIM images; HF apps → vLLM
-- Placement: `MODEL_DEPLOY_MODE`, `NIM_REPLICA_COUNT` / `VLLM_REPLICA_COUNT`, `TENSOR_PARALLEL_SIZE`, `GPU_DEVICES`
-- CLI: `python -m shared.deploy up|down|status|generate --engine nim|vllm`
+- Engine: NIM apps → NIM images (catalog or model-free); HF apps → vLLM or SGLang
+- Placement: `MODEL_DEPLOY_MODE`, `NIM_REPLICA_COUNT` / `VLLM_REPLICA_COUNT` / `SGLANG_REPLICA_COUNT`, `TENSOR_PARALLEL_SIZE`, `GPU_DEVICES`
+- CLI: `python -m shared.deploy up|down|status|generate --engine nim|vllm|sglang`
 - Pre-existing healthy `BACKEND_URLS` are used as-is and are **not** torn down on exit
 - Set `AUTO_DEPLOY_MODEL=false` in production/K8s when an orchestrator owns GPUs
 - **Multi physical GPU nodes**: set `DEPLOY_NODES=local,user@gpu1,user@gpu2` with passwordless SSH;
   control node inventories GPUs, packs replicas, `scp` + `docker compose up` on each host.
   See `deploy/env.multinode-ssh.example`. Cross-node TP is not auto-deployed (use coordinator URL).
 
-## HF apps and vLLM
+## HF apps and vLLM / SGLang
 
-All **hf-*** applications are **vLLM-only** clients (no in-process Transformers/torch weights).
-Set `BACKEND_URLS` or `VLLM_API_URL` to one or more OpenAI-compatible vLLM servers.
-`MODEL_DEPLOY_MODE=replica|hybrid|sharded` plus `VLLM_REPLICA_COUNT` / `TENSOR_PARALLEL_SIZE`
-drive how many vLLM containers the generator creates.
+All **hf-*** applications are remote OpenAI-compatible clients (no in-process Transformers/torch weights).
+Default engine is vLLM. Set `INFERENCE_ENGINE=sglang` or `HF_BACKEND=sglang` to auto-deploy
+[SGLang](https://docs.sglang.io/) (`lmsysorg/sglang:latest-runtime`, `sglang serve`, container port 30000).
+Set `BACKEND_URLS`, `VLLM_API_URL`, or `SGLANG_API_URL` to one or more already-running servers.
+`MODEL_DEPLOY_MODE=replica|hybrid|sharded` plus replica count / `TENSOR_PARALLEL_SIZE`
+drive how many containers the generator creates. See `deploy/env.sglang.example`.
+
+## NIM catalog and model-free (models not hosted by NVIDIA)
+
+Catalog NIM images (`nvcr.io/nim/<publisher>/<model>`) bake weights in and still need `NGC_API_KEY`.
+
+Models NVIDIA does not ship as a catalog container use a **model-free** NIM image. One image
+serves any backend-supported checkpoint from Hugging Face, S3, NGC, or a local directory:
+
+- SGLang: `nvcr.io/nim/nvidia/sglang-model-free-nim:latest` (2.1.2)
+- vLLM: `nvcr.io/nim/nvidia/vllm-model-free-nim:latest` (2.1.1)
+
+```bash
+export NIM_BACKEND=sglang
+export NIM_IMAGE=nvcr.io/nim/nvidia/sglang-model-free-nim:latest
+export NIM_MODEL_PATH=hf://Qwen/Qwen2.5-Coder-32B-Instruct
+export NIM_SERVED_MODEL_NAME=Qwen/Qwen2.5-Coder-32B-Instruct
+export NGC_API_KEY=...
+export HUGGING_FACE_HUB_TOKEN=...
+```
+
+Per-model JSON can set `deployment.engine` (`vllm`|`sglang`|`nim`), `deployment.nim_image`,
+and `deployment.nim_model_path` so one app can mix catalog NIM with model-free SGLang NIM.
+See `deploy/env.nim-modelfree.example`.
 
 GPU **working-set** KV stays inside vLLM (prefix cache). Optional **Mooncake** on the vLLM
 stack is hierarchical overflow / cross-replica share — not a replacement for GPU KV.

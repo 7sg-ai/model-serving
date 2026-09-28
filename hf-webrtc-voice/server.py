@@ -23,6 +23,7 @@ from shared.multinode import (
 )
 from shared.tools import get_web_access_tool, get_web_enricher
 from shared.model_catalog import deploy_app_models, load_app_models
+from shared.deploy.app_engine import resolve_app_engine
 
 os.environ.setdefault("LOAD_MODEL_WEIGHTS", "false")
 
@@ -54,7 +55,7 @@ SY_CFG = load_app_models(
     reload=True,
 )
 CATALOG, _HANDLES = deploy_app_models(
-    "vllm",
+    resolve_app_engine("hf"),
     SY_CFG,
     app_name="hf-webrtc-voice",
     api_key=VLLM_API_KEY,

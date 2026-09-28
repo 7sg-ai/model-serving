@@ -40,7 +40,7 @@ def resolve_vllm_backend_urls(
     """
     Resolve ordered chat-completion backend URLs for HF/vLLM clients.
 
-    Merges (first-seen order): coordinator, BACKEND_URLS family, VLLM_*, NIM_API_URL.
+    Merges (first-seen order): coordinator, BACKEND_URLS family, VLLM_*, SGLANG_*, NIM_API_URL.
     """
     ordered: List[str] = []
     seen = set()
@@ -67,6 +67,7 @@ def resolve_vllm_backend_urls(
         )
     )
     _add(os.getenv("VLLM_API_URLS", os.getenv("VLLM_API_URL", "")))
+    _add(os.getenv("SGLANG_API_URLS", os.getenv("SGLANG_API_URL", "")))
     _add(os.getenv("NIM_API_URL", ""))
     return ordered
 
@@ -81,9 +82,9 @@ def require_backend_urls(
     if not resolved:
         raise RuntimeError(
             f"No {what} backend configured. Set one of: "
-            "BACKEND_URLS, VLLM_API_URL, VLLM_API_URLS, or MODEL_COORDINATOR_URL "
+            "BACKEND_URLS, VLLM_API_URL, VLLM_API_URLS, SGLANG_API_URL, or MODEL_COORDINATOR_URL "
             "(OpenAI-compatible .../v1/chat/completions). "
-            "Start the vLLM stack (see deploy/docker-compose.vllm.yml)."
+            "Start a vLLM, SGLang, or NIM stack (see deploy/)."
         )
     return resolved
 
@@ -182,7 +183,7 @@ class OpenAIChatClient:
         if not url:
             raise RuntimeError(
                 "No inference backend available "
-                "(BACKEND_URLS / VLLM_API_URL empty or all cooling down)"
+                "(BACKEND_URLS / VLLM_API_URL / SGLANG_API_URL empty or all cooling down)"
             )
         endpoint = normalize_chat_url(url)
         try:

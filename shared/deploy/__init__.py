@@ -1,4 +1,4 @@
-"""Auto-deploy NIM / vLLM model containers with optional teardown on exit."""
+"""Auto-deploy NIM / vLLM / SGLang model containers with optional teardown on exit."""
 from .ensure import (
     RuntimeHandle,
     ensure_model_runtime,
