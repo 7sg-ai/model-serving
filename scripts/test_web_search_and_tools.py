@@ -9,6 +9,9 @@ if str(ROOT) not in sys.path:
 
 from shared.tools.web_search import extract_search_query, parse_ddg_html
 from shared.backends.streaming import completion_to_sse_chunks
+from shared.backends.anthropic_convert import anthropic_to_openai, strip_reasoning_content
+from shared.backends.anthropic_response import openai_to_anthropic, repair_tool_input
+from shared.backends.anthropic_stream import iter_openai_sse_as_anthropic
 from shared.backends.openai_tools import (
     apply_ide_tool_nudge,
     build_passthrough_extra,
@@ -158,6 +161,157 @@ def test_sse_tool_calls():
     assert found, blob
 
 
+def test_thinking_round_trip_and_caller_stays_off_openai():
+    body = {
+        "model": "claude-sonnet",
+        "max_tokens": 64,
+        "messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "check the file", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "secret"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read_file",
+                    "input": {"path": "a.py"},
+                    "caller": {"type": "direct"},
+                },
+            ],
+        }],
+    }
+    openai = anthropic_to_openai(body)
+    msg = openai["messages"][0]
+    assert msg["reasoning_content"] == "check the file"
+    assert msg["content"] is None
+    assert "signature" not in json.dumps(openai)
+    assert "caller" not in json.dumps(openai)
+    assert "redacted" not in json.dumps(openai)
+    assert msg["tool_calls"][0]["function"]["name"] == "read_file"
+
+    out = openai_to_anthropic({
+        "id": "chatcmpl-1",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "<think>inline</think>done",
+                "reasoning_content": "from the field",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\": \"a.py\"}"},
+                }],
+            },
+        }],
+    }, requested_model="claude-sonnet")
+    kinds = [b["type"] for b in out["content"]]
+    assert kinds == ["thinking", "text", "tool_use"]
+    assert out["content"][0]["thinking"] == "from the field"
+    assert "signature" not in out["content"][0]
+    assert out["content"][1]["text"] == "done"
+    assert out["content"][2]["caller"] == {"type": "direct"}
+    assert out["stop_reason"] == "tool_use"
+
+
+def test_truncated_tool_json_keeps_siblings():
+    cut = '{"path": "a.py", "note": "hel'
+    assert repair_tool_input(cut) == {"path": "a.py", "note": "hel"}
+    assert repair_tool_input('{"items": [1, 2') == {"items": [1, 2]}
+    assert repair_tool_input("{not json") is None
+
+    out = openai_to_anthropic({
+        "choices": [{
+            "finish_reason": "length",
+            "message": {
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_ok",
+                        "function": {"name": "read_file", "arguments": "{\"path\": \"a.py\"}"},
+                    },
+                    {
+                        "id": "call_cut",
+                        "function": {"name": "write", "arguments": '{"path": "b.py", "text": "hi'},
+                    },
+                    {
+                        "id": "call_dead",
+                        "function": {"name": "bash", "arguments": "{not json"},
+                    },
+                ],
+            },
+        }],
+    }, requested_model="claude-sonnet")
+    uses = [b for b in out["content"] if b["type"] == "tool_use"]
+    assert [b["name"] for b in uses] == ["read_file", "write"]
+    assert uses[1]["input"] == {"path": "b.py", "text": "hi"}
+    assert all(b["caller"]["type"] == "direct" for b in uses)
+    assert out["stop_reason"] == "tool_use"
+    assert not any(b.get("input") == {} and b["name"] == "bash" for b in uses)
+
+    none = openai_to_anthropic({
+        "choices": [{
+            "finish_reason": "length",
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_dead",
+                    "function": {"name": "bash", "arguments": "{not json"},
+                }],
+            },
+        }],
+    }, requested_model="claude-sonnet")
+    assert none["stop_reason"] == "max_tokens"
+    assert not any(b["type"] == "tool_use" for b in none["content"])
+
+    finished = openai_to_anthropic({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_dead",
+                    "function": {"name": "bash", "arguments": "{not json"},
+                }],
+            },
+        }],
+    }, requested_model="claude-sonnet")
+    assert finished["stop_reason"] == "end_turn"
+    assert "bash" in finished["content"][-1]["text"]
+    stripped = strip_reasoning_content({
+        "messages": [{"role": "assistant", "content": "x", "reasoning_content": "y"}]
+    })
+    assert "reasoning_content" not in stripped["messages"][0]
+
+
+def test_stream_recovers_cut_json_without_relabeling():
+    lines = [
+        'data: ' + json.dumps({
+            "choices": [{
+                "delta": {"reasoning_content": "plan"},
+                "finish_reason": None,
+            }]
+        }),
+        'data: ' + json.dumps({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "write", "arguments": '{"path": "a.py"'},
+                }]},
+                "finish_reason": "tool_calls",
+            }]
+        }),
+        "data: [DONE]",
+    ]
+    blob = "".join(iter_openai_sse_as_anthropic(iter(lines), requested_model="claude-sonnet"))
+    assert "thinking_delta" in blob
+    assert '"caller": {"type": "direct"}' in blob or '"caller":{"type":"direct"}' in blob
+    assert "a.py" in blob
+    assert '"stop_reason": "tool_use"' in blob
+    assert "max_tokens" not in blob
+
+
 if __name__ == "__main__":
     test_extract_search_query()
     test_parse_ddg_html()
@@ -166,4 +320,7 @@ if __name__ == "__main__":
     test_preserve_transcript_and_continuation()
     test_context_length_error_mapping()
     test_sse_tool_calls()
+    test_thinking_round_trip_and_caller_stays_off_openai()
+    test_truncated_tool_json_keeps_siblings()
+    test_stream_recovers_cut_json_without_relabeling()
     print("all tests passed")

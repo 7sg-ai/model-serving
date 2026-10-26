@@ -37,6 +37,13 @@ from shared.backends import (
     should_preserve_client_transcript,
     should_skip_response_cache,
     stable_session_id,
+    tag_anthropic_completion,
+    tag_anthropic_upstream,
+)
+from shared.backends.anthropic_flask import (
+    anthropic_api_key,
+    count_tokens_response,
+    messages_response,
 )
 from shared.multinode import (
     BackendPool,
@@ -172,12 +179,8 @@ if SY_CFG.enabled and SY_CFG.routes_toml_path:
 
 
 def verify_api_key(req):
-    """Verify API key from request"""
-    auth_header = req.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        return token == API_KEY
-    return False
+    """Verify API key from Authorization: Bearer or Anthropic x-api-key."""
+    return anthropic_api_key(req, API_KEY)
 
 
 def ensure_system_message(messages):
@@ -393,8 +396,9 @@ def chat_completions():
                     extra=passthrough_extra or None,
                 )
                 if outcome.is_live_stream:
-                    return flask_sse_from_upstream(
-                        outcome.upstream, on_complete=_on_complete
+                    return tag_anthropic_upstream(
+                        flask_sse_from_upstream(outcome.upstream, on_complete=_on_complete),
+                        outcome.upstream,
                     )
                 result = outcome.completion or {
                     "choices": [
@@ -414,9 +418,12 @@ def chat_completions():
                     or requested_model
                     or MODEL_NAME
                 )
-                return flask_sse_from_completion(
-                    result if isinstance(result, dict) else result,
-                    model=model_out,
+                return tag_anthropic_completion(
+                    flask_sse_from_completion(
+                        result if isinstance(result, dict) else result,
+                        model=model_out,
+                    ),
+                    result if isinstance(result, dict) else {},
                 )
 
             upstream = _legacy_upstream_chat(
@@ -427,7 +434,10 @@ def chat_completions():
                 MODEL_NAME,
                 extra=passthrough_extra or None,
             )
-            return flask_sse_from_upstream(upstream, on_complete=_on_complete)
+            return tag_anthropic_upstream(
+                flask_sse_from_upstream(upstream, on_complete=_on_complete),
+                upstream,
+            )
 
         if SY_CFG.enabled:
             result, assistant_content, _served = SY_ROUTER.chat_completions(
@@ -468,6 +478,55 @@ def chat_completions():
     except Exception as e:
         body, status = openai_error_from_upstream(e, fallback_code="nim_error")
         return jsonify(body), status
+
+
+@app.route("/v1/messages", methods=["POST"])
+def anthropic_messages():
+    """Anthropic Messages API. Same inference path as /v1/chat/completions."""
+    if not verify_api_key(request):
+        return jsonify({"type": "error", "error": {"type": "authentication_error", "message": "Invalid API key"}}), 401
+    return messages_response(request, _unwrap_chat, default_model=MODEL_NAME)
+
+
+def _unwrap_chat(openai_body):
+    """Run the OpenAI handler and return a dict or a tagged stream response."""
+    with app.test_request_context(
+        "/v1/chat/completions",
+        method="POST",
+        json=openai_body,
+        headers={"Authorization": f"Bearer {API_KEY}"},
+    ):
+        result = chat_completions()
+    response, status = result if isinstance(result, tuple) else (result, getattr(result, "status_code", 200))
+    if status and status >= 400:
+        raise RuntimeError(_response_error_text(response))
+    if getattr(response, "mimetype", "") == "text/event-stream":
+        return response
+    data = response.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise RuntimeError("Upstream returned an empty completion")
+    if data.get("error"):
+        err = data["error"]
+        raise RuntimeError(err.get("message") if isinstance(err, dict) else str(err))
+    return data
+
+
+def _response_error_text(response) -> str:
+    data = response.get_json(silent=True) if hasattr(response, "get_json") else None
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message") or err)
+        return str(data)
+    return "Upstream chat completion failed"
+
+
+@app.route("/v1/messages/count_tokens", methods=["POST"])
+def anthropic_count_tokens():
+    if not verify_api_key(request):
+        return jsonify({"type": "error", "error": {"type": "authentication_error", "message": "Invalid API key"}}), 401
+    return count_tokens_response(request)
+
 
 
 

@@ -22,7 +22,8 @@ import requests
 from .client import ModelClient
 from .config import ModelSpec, SwitchyardConfig, get_switchyard_config
 from .escalation import EscalationRouter, EscalationResult, build_escalation_router
-from shared.backends.openai_tools import is_tool_continuation
+from shared.backends.openai_tools import is_tool_continuation, looks_tool_capable
+from shared.backends.anthropic_convert import claude_tier_hint
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,16 @@ class SwitchyardRouter:
         # Unknown model with allow_model_select → try direct; else route
         if self.cfg.allow_model_select and self.cfg.model_by_id_or_name(key):
             return False
+        # Claude Code ids (haiku/sonnet/opus) are tier hints, not pins.
+        # A real ModelSpec match above wins; otherwise the strategy route
+        # starts at the hinted tier.
         return True
+
+    def hinted_role(self, requested_model: Optional[str]) -> Optional[str]:
+        if self.resolve_spec(requested_model) is not None:
+            return None
+        return claude_tier_hint(requested_model)
+
 
     # ----- generation helpers -----
 
@@ -333,6 +343,7 @@ class SwitchyardRouter:
         extra: Optional[Dict[str, Any]] = None,
         *,
         freeze_model: bool = False,
+        hinted_role: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], str, ModelSpec]:
         weak = self.cfg.weak()
         if not weak:
@@ -340,10 +351,15 @@ class SwitchyardRouter:
 
         if freeze_model:
             pick = weak
+        elif hinted_role == "strong" and self.cfg.strong():
+            pick = self.cfg.strong()
+        elif hinted_role == "weak":
+            pick = weak
         else:
             pick, _meta = self._capability_pick(messages)
             if pick is None:
                 pick = weak
+        pick = self._prefer_tool_spec(pick, extra) or pick
 
         mt = max(1, min(int(max_tokens), pick.context_window - 512))
         resp, text = self._call_spec(pick, messages, temperature, mt, extra=extra)
@@ -373,6 +389,7 @@ class SwitchyardRouter:
         pick = self._sticky_spec(session_id, models) if freeze_model else random.choice(models)
         if pick is None:
             pick = models[0]
+        pick = self._prefer_tool_spec(pick, extra) or pick
         mt = max(1, min(int(max_tokens), pick.context_window - 512))
         resp, text = self._call_spec(pick, messages, temperature, mt, extra=extra)
         resp = dict(resp)
@@ -391,6 +408,47 @@ class SwitchyardRouter:
             return False
         tools = extra.get("tools")
         return isinstance(tools, list) and len(tools) > 0
+
+    def _prefer_tool_spec(self, spec: Optional[ModelSpec], extra: Optional[Dict[str, Any]]) -> Optional[ModelSpec]:
+        """If this turn carries tools, serve a model that will attempt them.
+
+        A pinned id that already looks tool-capable is left alone. Otherwise
+        prefer the strong tier when it looks capable, then any selectable
+        model whose id matches the known function-calling hints. Returns the
+        original spec when nothing better is configured — translation still
+        forwards the schemas, the backend just may ignore them.
+        """
+        if spec is None or not self._tools_in_extra(extra):
+            return spec
+        if looks_tool_capable(spec.id) or looks_tool_capable(spec.name):
+            return spec
+        strong = self.cfg.strong()
+        if strong and strong is not spec and (
+            looks_tool_capable(strong.id) or looks_tool_capable(strong.name)
+        ):
+            return strong
+        for candidate in self.cfg.selectable_models():
+            if looks_tool_capable(candidate.id) or looks_tool_capable(candidate.name):
+                return candidate
+        return spec
+
+    def _latch_for_tools(self, session_id: str, extra: Optional[Dict[str, Any]]) -> bool:
+        """Latch escalation to strong when tools arrive and weak cannot call them."""
+        if not self._tools_in_extra(extra) or not self.escalation:
+            return False
+        esc = self.escalation
+        if esc.is_latched(session_id):
+            return True
+        if looks_tool_capable(esc.weak.id) or looks_tool_capable(esc.weak.name):
+            return False
+        if not (looks_tool_capable(esc.strong.id) or looks_tool_capable(esc.strong.name)):
+            return False
+        state = esc.get_state(session_id)
+        state.latched = True
+        state.consecutive_escalations = max(state.consecutive_escalations, 1)
+        return True
+
+
 
     def _direct_with_extra(
         self,
@@ -498,6 +556,7 @@ class SwitchyardRouter:
         if strategy == "escalation":
             if not self.escalation:
                 raise RuntimeError("Escalation router not configured (need weak + strong models)")
+            self._latch_for_tools(session_id or "default", extra)
             # Use weak defaults for unspecified temp/tokens; router applies per-tier
             temp = temperature
             mt = max_tokens
@@ -524,6 +583,7 @@ class SwitchyardRouter:
                 mt,
                 extra,
                 freeze_model=freeze,
+                hinted_role=self.hinted_role(requested_model),
             )
             self._remember_spec(session_id or "default", spec)
             return resp, text, spec
@@ -543,7 +603,7 @@ class SwitchyardRouter:
             return resp, text, spec
 
         # passthrough
-        spec = self.cfg.default_model()
+        spec = self._prefer_tool_spec(self.cfg.default_model(), extra)
         if not spec:
             raise RuntimeError("No models configured")
         return self._direct_with_extra(
@@ -689,6 +749,7 @@ class SwitchyardRouter:
                     "Escalation router not configured (need weak + strong models)"
                 )
             esc = self.escalation
+            self._latch_for_tools(sid, extra)
             # Already latched → live strong stream
             if esc.is_latched(sid):
                 temp = temperature
@@ -766,7 +827,16 @@ class SwitchyardRouter:
                     "frozen": True,
                 }
             else:
-                chosen, meta = self._capability_pick(messages)
+                role = self.hinted_role(requested_model)
+                if role == "strong" and self.cfg.strong():
+                    chosen = self.cfg.strong()
+                    meta = {"route": "capability", "served_by": chosen.role, "model_id": chosen.id, "hint": role}
+                elif role == "weak" and self.cfg.weak():
+                    chosen = self.cfg.weak()
+                    meta = {"route": "capability", "served_by": chosen.role, "model_id": chosen.id, "hint": role}
+                else:
+                    chosen, meta = self._capability_pick(messages)
+                chosen = self._prefer_tool_spec(chosen, extra) or chosen
                 self._remember_spec(sid, chosen)
             temp = float(temperature) if temperature is not None else chosen.temperature
             mt = int(max_tokens) if max_tokens is not None else chosen.max_tokens
@@ -785,6 +855,7 @@ class SwitchyardRouter:
             spec = self._sticky_spec(sid, models) if freeze else random.choice(models)
             if spec is None:
                 spec = models[0]
+            spec = self._prefer_tool_spec(spec, extra) or spec
             self._remember_spec(sid, spec)
             temp = float(temperature) if temperature is not None else spec.temperature
             mt = int(max_tokens) if max_tokens is not None else spec.max_tokens
@@ -801,7 +872,7 @@ class SwitchyardRouter:
             )
 
         # passthrough
-        spec = self.cfg.default_model()
+        spec = self._prefer_tool_spec(self.cfg.default_model(), extra)
         if not spec:
             raise RuntimeError("No models configured")
         return self._stream_with_extra(

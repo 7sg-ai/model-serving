@@ -41,6 +41,8 @@ from shared.backends import (
     should_preserve_client_transcript,
     should_skip_response_cache,
     stable_session_id,
+    tag_anthropic_completion,
+    tag_anthropic_upstream,
 )
 
 from shared.deploy import ensure_models_runtime
@@ -247,10 +249,10 @@ if _cache_stats.get("mooncake_error"):
 
 
 def verify_api_key(req):
-    auth_header = req.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        return auth_header[7:] == API_KEY
-    return False
+    """Verify API key from Authorization: Bearer or Anthropic x-api-key."""
+    from shared.backends.anthropic_flask import anthropic_api_key
+
+    return anthropic_api_key(req, API_KEY)
 
 
 def ensure_system_message(messages):
@@ -422,8 +424,9 @@ def chat_completions():
                     extra=passthrough_extra or None,
                 )
                 if outcome.is_live_stream:
-                    return flask_sse_from_upstream(
-                        outcome.upstream, on_complete=_on_complete
+                    return tag_anthropic_upstream(
+                        flask_sse_from_upstream(outcome.upstream, on_complete=_on_complete),
+                        outcome.upstream,
                     )
                 result = outcome.completion or {
                     "choices": [
@@ -443,9 +446,12 @@ def chat_completions():
                     or requested_model
                     or MODEL_NAME
                 )
-                return flask_sse_from_completion(
-                    result if isinstance(result, dict) else result,
-                    model=model_out,
+                return tag_anthropic_completion(
+                    flask_sse_from_completion(
+                        result if isinstance(result, dict) else result,
+                        model=model_out,
+                    ),
+                    result if isinstance(result, dict) else {},
                 )
 
             backend = CLUSTER.next_backend()
@@ -469,7 +475,10 @@ def chat_completions():
             except Exception:
                 CLUSTER.backend_pool.mark_failure(backend)
                 raise
-            return flask_sse_from_upstream(upstream, on_complete=_on_complete)
+            return tag_anthropic_upstream(
+                flask_sse_from_upstream(upstream, on_complete=_on_complete),
+                upstream,
+            )
 
         if SY_CFG.enabled:
             result, response_text, served = SY_ROUTER.chat_completions(
@@ -540,6 +549,49 @@ def chat_completions():
     if cache_key is not None:
         response_cache.set(cache_key, result)
     return jsonify(result)
+
+
+@app.route("/v1/messages", methods=["POST"])
+def anthropic_messages():
+    """Anthropic Messages API. Same inference path as /v1/chat/completions."""
+    from shared.backends.anthropic_flask import messages_response
+
+    if not verify_api_key(request):
+        return jsonify({"type": "error", "error": {"type": "authentication_error", "message": "Invalid API key"}}), 401
+    return messages_response(request, _unwrap_chat, default_model=MODEL_NAME)
+
+
+def _unwrap_chat(openai_body):
+    with app.test_request_context(
+        "/v1/chat/completions",
+        method="POST",
+        json=openai_body,
+        headers={"Authorization": f"Bearer {API_KEY}"},
+    ):
+        result = chat_completions()
+    response, status = result if isinstance(result, tuple) else (result, getattr(result, "status_code", 200))
+    if status and status >= 400:
+        data = response.get_json(silent=True) if hasattr(response, "get_json") else None
+        message = "Upstream chat completion failed"
+        if isinstance(data, dict):
+            err = data.get("error")
+            message = err.get("message") if isinstance(err, dict) else str(data)
+        raise RuntimeError(message)
+    if getattr(response, "mimetype", "") == "text/event-stream":
+        return response
+    data = response.get_json(silent=True)
+    if not isinstance(data, dict) or data.get("error"):
+        raise RuntimeError("Upstream returned an empty completion")
+    return data
+
+
+@app.route("/v1/messages/count_tokens", methods=["POST"])
+def anthropic_count_tokens():
+    from shared.backends.anthropic_flask import count_tokens_response
+
+    if not verify_api_key(request):
+        return jsonify({"type": "error", "error": {"type": "authentication_error", "message": "Invalid API key"}}), 401
+    return count_tokens_response(request)
 
 
 @app.route("/v1/completions", methods=["POST"])

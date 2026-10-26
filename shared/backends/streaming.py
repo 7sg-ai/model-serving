@@ -220,6 +220,16 @@ def flask_sse_from_upstream(
     )
 
 
+def tag_anthropic_upstream(response, upstream: requests.Response):
+    """Mark a proxied OpenAI SSE response so the Messages adapter can translate it."""
+    try:
+        response._anthropic_upstream = upstream
+    except Exception:
+        pass
+    return response
+
+
+
 def completion_to_sse_chunks(
     result: Dict[str, Any],
     *,
@@ -397,3 +407,13 @@ def flask_sse_from_completion(
         mimetype="text/event-stream",
         headers=dict(SSE_HEADERS),
     )
+
+
+def tag_anthropic_completion(response, result: Dict[str, Any]):
+    """Attach the source completion so Anthropic SSE can be synthesized from it."""
+    try:
+        response._anthropic_completion = result
+    except Exception:
+        pass
+    return response
+
