@@ -42,9 +42,9 @@ services:
   hf-ide-assistant:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile.python
+      dockerfile: deploy/Dockerfile.rust
     working_dir: /app/hf-ide-assistant
-    command: ["python", "server.py"]
+    command: ["hf-ide-assistant"]
     environment:
       LOAD_MODEL_WEIGHTS: "false"
       MODEL_DEPLOY_MODE: ${MODEL_DEPLOY_MODE:-replica}

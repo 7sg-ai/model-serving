@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "shared",
+    "hf-ide-assistant",
+    "nim-ide-assistant",
+    "hf-streamlit-chat",
+    "nim-streamlit-chat",
+    "hf-webrtc-voice",
+    "nim-webrtc-voice",
+    "scripts",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/7sg-ai/model-serving"
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = { version = "0.7", features = ["json", "macros", "ws"] }
+base64 = "0.22"
+bytes = "1.7"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+futures-util = "0.3"
+html-escape = "0.2"
+http = "1.1"
+indexmap = { version = "2.5", features = ["serde"] }
+once_cell = "1.19"
+ parking_lot = "0.12"
+rand = "0.8"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+socketioxide = { version = "0.14", features = ["state"] }
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+urlencoding = "2.1"
+uuid = { version = "1.10", features = ["v4"] }

@@ -129,7 +129,7 @@ scenarios:
             repository: model-serving/hf-streamlit-chat
             tag: latest
             context: .
-            dockerfile: deploy/Dockerfile.python
+            dockerfile: deploy/Dockerfile.rust
           resources:
             cpu: '2'
             memory: 4Gi

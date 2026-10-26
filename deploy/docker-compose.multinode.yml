@@ -19,9 +19,9 @@ services:
   nim-ide-1:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile.python
+      dockerfile: deploy/Dockerfile.rust
     working_dir: /app/nim-ide-assistant
-    command: ["python", "server.py"]
+    command: ["nim-ide-assistant"]
     environment:
       MULTI_NODE: "true"
       CLUSTER_NAME: model-serving
@@ -49,9 +49,9 @@ services:
   nim-ide-2:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile.python
+      dockerfile: deploy/Dockerfile.rust
     working_dir: /app/nim-ide-assistant
-    command: ["python", "server.py"]
+    command: ["nim-ide-assistant"]
     environment:
       MULTI_NODE: "true"
       CLUSTER_NAME: model-serving

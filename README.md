@@ -23,14 +23,29 @@ All applications include:
 
 ## Prerequisites
 
-- Python 3.8+
+- Rust 1.80+ (`cargo` & `rustc`)
 - Docker (for NIM and vLLM model servers)
 - NVIDIA GPU (recommended for better performance)
-- Node.js (for WebRTC applications)
 
 ## Quick Start
 
-Each application has its own directory with specific setup instructions. Navigate to the respective directory and follow the README.md file.
+Build and test the entire Rust workspace from the repository root:
+
+```bash
+cargo build --release --workspace
+cargo test --workspace
+```
+
+Run any of the applications using `cargo run`:
+
+```bash
+cargo run --bin hf-ide-assistant
+cargo run --bin nim-ide-assistant
+cargo run --bin hf-streamlit-chat
+cargo run --bin nim-streamlit-chat
+cargo run --bin hf-webrtc-voice
+cargo run --bin nim-webrtc-voice
+```
 
 ## Directory Structure
 
@@ -63,7 +78,7 @@ All applications support multi-node / multi-replica deployment through `shared/m
 - **Env template**: `deploy/env.multinode.example`
 - **Docs**: [`shared/multinode/README.md`](shared/multinode/README.md)
 - **HF / vLLM stack**: `deploy/docker-compose.vllm.yml`, `deploy/env.vllm.example`,
-  `deploy/scripts/generate_vllm_compose.py` (replica/hybrid multi-instance)
+  `cargo run --bin generate-vllm-compose` (replica/hybrid multi-instance)
 
 ## Auto-deploy model containers
 
@@ -73,7 +88,7 @@ NIM and HF apps can **start their model servers via Docker Compose** on startup:
 - `AUTO_DEPLOY_TEARDOWN_ON_EXIT=true` (default) — stop **owned** containers when the app exits
 - Engine: NIM apps → NIM images (catalog or model-free); HF apps → vLLM or SGLang
 - Placement: `MODEL_DEPLOY_MODE`, `NIM_REPLICA_COUNT` / `VLLM_REPLICA_COUNT` / `SGLANG_REPLICA_COUNT`, `TENSOR_PARALLEL_SIZE`, `GPU_DEVICES`
-- CLI: `python -m shared.deploy up|down|status|generate --engine nim|vllm|sglang`
+- CLI: `cargo run -p model-serving-shared --bin deploy -- up|down|status|generate --engine nim|vllm|sglang`
 - Pre-existing healthy `BACKEND_URLS` are used as-is and are **not** torn down on exit
 - Set `AUTO_DEPLOY_MODEL=false` in production/K8s when an orchestrator owns GPUs
 - **Multi physical GPU nodes**: set `DEPLOY_NODES=local,user@gpu1,user@gpu2` with passwordless SSH;

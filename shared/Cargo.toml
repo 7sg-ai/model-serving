@@ -1,0 +1,45 @@
+[package]
+name = "model-serving-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "model_serving_shared"
+path = "src/lib.rs"
+
+[[bin]]
+name = "deploy"
+path = "src/bin/deploy.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+html-escape.workspace = true
+http.workspace = true
+indexmap.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+socketioxide.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+toml.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+uuid.workspace = true
