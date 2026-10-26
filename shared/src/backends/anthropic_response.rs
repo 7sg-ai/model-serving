@@ -66,9 +66,9 @@ pub fn repair_tool_input(raw: Option<&Value>) -> Option<Value> {
             in_string = true;
         } else if ch == '{' || ch == '[' {
             stack.push(ch);
-        } else if ch == '}' && stack.last() == Some(&'{') {
-            stack.pop();
-        } else if ch == ']' && stack.last() == Some(&'[') {
+        } else if (ch == '}' && stack.last() == Some(&'{'))
+            || (ch == ']' && stack.last() == Some(&'['))
+        {
             stack.pop();
         }
     }
@@ -247,7 +247,7 @@ pub fn estimate_input_tokens(openai_body: &Value) -> usize {
         "tools": openai_body.get("tools").cloned().unwrap_or_else(|| json!([])),
     }))
     .unwrap_or_default();
-    ((blob.len() + 3) / 4).max(1)
+    blob.len().div_ceil(4).max(1)
 }
 
 pub fn anthropic_error(message: &str, error_type: &str, status: u16) -> (Value, u16) {

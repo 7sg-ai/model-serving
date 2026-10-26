@@ -111,11 +111,9 @@ impl SwitchyardRouter {
 
     fn first_tool_capable(&self) -> Option<ModelSpec> {
         let selectable = self.cfg.selectable_models();
-        for tier in [self.cfg.strong(), self.cfg.weak()] {
-            if let Some(s) = tier {
-                if looks_tool_capable(&s.id) {
-                    return Some(s.clone());
-                }
+        for s in [self.cfg.strong(), self.cfg.weak()].into_iter().flatten() {
+            if looks_tool_capable(&s.id) {
+                return Some(s.clone());
             }
         }
         selectable.into_iter().find(|s| looks_tool_capable(&s.id))

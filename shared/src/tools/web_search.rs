@@ -106,10 +106,8 @@ fn unwrap_ddg_redirect(href: &str) -> String {
                 || parsed.query().unwrap_or("").contains("uddg="))
         {
             for (k, v) in parsed.query_pairs() {
-                if k == "uddg" || k == "u" {
-                    if !v.is_empty() {
-                        return v.into_owned();
-                    }
+                if (k == "uddg" || k == "u") && !v.is_empty() {
+                    return v.into_owned();
                 }
             }
         }

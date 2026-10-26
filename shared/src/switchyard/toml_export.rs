@@ -86,19 +86,19 @@ pub fn export_routes_toml(cfg: &SwitchyardConfig) -> String {
     let judge = cfg.judge();
     let route_key = safe_key(&cfg.route_id.replace('/', "_"));
 
-    if cfg.strategy == "escalation" && weak.is_some() && strong.is_some() {
-        let w = weak.unwrap();
-        let s = strong.unwrap();
-        let j = judge.unwrap_or(w);
-        lines.push(format!("[routes.{route_key}]"));
-        lines.push(format!("id = {}", toml_str(&cfg.route_id)));
-        lines.push("type = \"llm_classifier\"".to_string());
-        lines.push("mode = \"escalation\"".to_string());
-        lines.push(format!("classifier_target = {}", toml_str(&safe_key(&j.name))));
-        lines.push(format!("strong_target = {}", toml_str(&safe_key(&s.name))));
-        lines.push(format!("weak_target = {}", toml_str(&safe_key(&w.name))));
-        lines.push(format!("max_output_tokens = {}", cfg.escalation.max_output_tokens));
-        lines.push("".to_string());
+    if cfg.strategy == "escalation" {
+        if let (Some(w), Some(s)) = (weak, strong) {
+            let j = judge.unwrap_or(w);
+            lines.push(format!("[routes.{route_key}]"));
+            lines.push(format!("id = {}", toml_str(&cfg.route_id)));
+            lines.push("type = \"llm_classifier\"".to_string());
+            lines.push("mode = \"escalation\"".to_string());
+            lines.push(format!("classifier_target = {}", toml_str(&safe_key(&j.name))));
+            lines.push(format!("strong_target = {}", toml_str(&safe_key(&s.name))));
+            lines.push(format!("weak_target = {}", toml_str(&safe_key(&w.name))));
+            lines.push(format!("max_output_tokens = {}", cfg.escalation.max_output_tokens));
+            lines.push("".to_string());
+        }
     } else if let Some(m) = cfg.default_model().or_else(|| cfg.models.first()) {
         lines.push(format!("[routes.{route_key}]"));
         lines.push(format!("id = {}", toml_str(&cfg.route_id)));

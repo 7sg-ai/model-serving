@@ -103,6 +103,7 @@ pub fn extract_assistant_text(result: &Value) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn chat_completions(
     url: &str,
     messages: &[Value],

@@ -62,6 +62,7 @@ pub fn parse_sse_data_line(line: &str) -> Option<Value> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn post_chat_stream_blocking(
     url: &str,
     messages: &[Value],
@@ -91,7 +92,7 @@ pub fn post_chat_stream_blocking(
     }
 
     let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs_f64(timeout_secs.min(30.0).max(1.0)))
+        .connect_timeout(Duration::from_secs_f64(timeout_secs.clamp(1.0, 30.0)))
         .timeout(Duration::from_secs_f64(timeout_secs.max(1.0)))
         .build()?;
     let mut req = client
